@@ -28,8 +28,9 @@ from models import (
     HORIZONS, HorizonForecast,
     forecast_gbm, forecast_arima, forecast_xgboost, forecast_mlp,
     XGBHorizonModel, MLPHorizonModel, ensemble_forecast,
+    _quantiles, daily_volatility,
 )
-from features import prepare_xy, build_features
+from features import prepare_xy, build_features, make_target
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
@@ -68,7 +69,13 @@ def walk_forward(raw_df: pd.DataFrame,
                  include_mlp: bool = False,   # MLP по умолчанию выключен (медленный + переобучается)
                  include_arima: bool = True,
                  include_gbm: bool = True,
-                 verbose: bool = True) -> Dict[str, pd.DataFrame]:
+                 verbose: bool = True,
+                 progress_callback=None) -> Dict[str, pd.DataFrame]:
+    """Walk-forward валидация.
+
+    progress_callback(step, total) — опциональная функция для UI-прогресса
+    (например, st.progress в Streamlit).
+    """
     """
     Возвращает {model_name: DataFrame с метриками по каждому горизонту}.
     Дополнительно — детальные прогнозы доступны через результат.
@@ -92,22 +99,49 @@ def walk_forward(raw_df: pd.DataFrame,
     # Накопители прогнозов: predictions[(model, H)] -> list of dict
     predictions: Dict[tuple, List[dict]] = {}
 
-    # Для ускорения предрасчитаем features 1 раз (X_now будет нарезаться)
+    horizons_days = [h["days"] for h in horizons]
+    max_horizon = max(horizons_days)
+
+    # ====================================================================
+    # ПРЕДВАРИТЕЛЬНЫЕ ВЫЧИСЛЕНИЯ — выполняются 1 раз, не на каждой точке
+    # ====================================================================
+
+    # (1) Фичи — point-in-time, поэтому строим один раз на полной истории
+    if verbose:
+        logger.info("Pre-compute: features…")
     features_all = build_features(raw_df)
-    features_all = features_all.drop(columns=[c for c in ["log_price"] if c in features_all.columns])
+    features_all = features_all.drop(
+        columns=[c for c in ["log_price"] if c in features_all.columns]
+    )
+    # Авто-дроп редких колонок (покрытие <50%) — один раз для всех t
+    coverage = features_all.notna().mean()
+    sparse_cols = coverage[coverage < 0.5].index.tolist()
+    if sparse_cols:
+        features_all = features_all.drop(columns=sparse_cols)
+
+    # (2) Таргеты для каждого H — тоже один раз
+    if verbose:
+        logger.info("Pre-compute: targets for each horizon…")
+    targets_by_H = {H: make_target(raw_df, H) for H in horizons_days}
+
+    # ====================================================================
+    # ЦИКЛ ПО ТОЧКАМ
+    # ====================================================================
+    from statsmodels.tsa.arima.model import ARIMA as _ARIMA  # импорт один раз
 
     for step_i, t in enumerate(forecast_indices):
         prices_t = prices.iloc[: t + 1]   # включая текущую точку
         p0 = float(prices_t.iloc[-1])
         date_t = prices_t.index[-1]
+        p0_log = math.log(p0)
+        sigma_d = daily_volatility(prices_t, 60)
 
         # Цены на горизонтах вперёд (для метрик)
-        actuals = {h["days"]: float(prices.iloc[t + h["days"]]) for h in horizons}
+        actuals = {H: float(prices.iloc[t + H]) for H in horizons_days}
 
-        for h in horizons:
-            H = h["days"]
-            # GBM
-            if include_gbm:
+        # ---------- GBM (быстрый, на каждый H) ----------
+        if include_gbm:
+            for H in horizons_days:
                 try:
                     fc = forecast_gbm(prices_t, H)
                     predictions.setdefault(("GBM", H), []).append({
@@ -116,52 +150,92 @@ def walk_forward(raw_df: pd.DataFrame,
                     })
                 except Exception as exc:
                     logger.warning("GBM t=%s H=%d failed: %s", date_t, H, exc)
-            # ARIMA
-            if include_arima:
-                try:
-                    fc = forecast_arima(prices_t, H)
+
+        # ---------- ARIMA — ОДИН фит на max_horizon, потом срезы по H ----------
+        if include_arima:
+            try:
+                log_p = np.log(prices_t.tail(750).dropna())
+                fit = _ARIMA(log_p, order=(1, 1, 1),
+                              enforce_stationarity=False,
+                              enforce_invertibility=False).fit(
+                    method_kwargs={"warn_convergence": False}
+                )
+                forecast = fit.get_forecast(steps=max_horizon)
+                pred_mean = np.asarray(forecast.predicted_mean)
+                se_mean = np.asarray(forecast.se_mean)
+                for H in horizons_days:
+                    mean_log = float(pred_mean[H - 1])
+                    sigma_T = max(float(se_mean[H - 1]), 1e-9)
+                    mu_T = mean_log - p0_log
+                    point = math.exp(mean_log)
+                    q = _quantiles(p0, mu_T, sigma_T)
                     predictions.setdefault(("ARIMA", H), []).append({
                         "date": date_t, "p0": p0, "actual": actuals[H],
-                        "point": fc.point, "p10": fc.p10, "p90": fc.p90,
+                        "point": point, "p10": q["p10"], "p90": q["p90"],
                     })
-                except Exception as exc:
-                    logger.warning("ARIMA t=%s H=%d failed: %s", date_t, H, exc)
-            # XGBoost / MLP — обучаем на данных до t (включительно)
-            X = y = x_now = None
-            if include_xgb or include_mlp:
-                try:
-                    sub_raw = raw_df.iloc[: t + 1]
-                    X, y = prepare_xy(sub_raw, H)
-                    if len(X) < 200:
-                        X = y = None
-                    else:
-                        x_now = features_all.loc[[date_t]].reindex(columns=list(X.columns))
-                except Exception as exc:
-                    logger.warning("X/y t=%s H=%d failed: %s", date_t, H, exc)
-                    X = y = x_now = None
-
-            if include_xgb and X is not None:
-                try:
-                    fc, _ = forecast_xgboost(prices_t, X, y, x_now, H)
-                    predictions.setdefault(("XGBoost", H), []).append({
+            except Exception as exc:
+                # Fallback: GBM-style для всех H
+                logger.warning("ARIMA t=%s failed (%s) → fallback GBM-style", date_t, exc)
+                from models import daily_drift
+                mu_d = daily_drift(prices_t, 60) * 0.5
+                for H in horizons_days:
+                    mu_T = mu_d * H
+                    sigma_T = sigma_d * math.sqrt(H)
+                    point = p0 * math.exp(mu_T)
+                    q = _quantiles(p0, mu_T, sigma_T)
+                    predictions.setdefault(("ARIMA", H), []).append({
                         "date": date_t, "p0": p0, "actual": actuals[H],
-                        "point": fc.point, "p10": fc.p10, "p90": fc.p90,
+                        "point": point, "p10": q["p10"], "p90": q["p90"],
                     })
-                except Exception as exc:
-                    logger.warning("XGB t=%s H=%d failed: %s", date_t, H, exc)
 
-            if include_mlp and X is not None:
-                try:
-                    fc, _ = forecast_mlp(prices_t, X, y, x_now, H)
-                    predictions.setdefault(("MLP", H), []).append({
-                        "date": date_t, "p0": p0, "actual": actuals[H],
-                        "point": fc.point, "p10": fc.p10, "p90": fc.p90,
-                    })
-                except Exception as exc:
-                    logger.warning("MLP t=%s H=%d failed: %s", date_t, H, exc)
+        # ---------- XGBoost / MLP: используем кэшированные features и targets ----------
+        if include_xgb or include_mlp:
+            # X_full точка t (последняя строка) для predict
+            try:
+                x_now_full = features_all.loc[[date_t]]
+            except KeyError:
+                x_now_full = None
 
-        if verbose and (step_i + 1) % 10 == 0:
-            logger.info("  → пройдено %d/%d точек", step_i + 1, len(forecast_indices))
+            for H in horizons_days:
+                if x_now_full is None:
+                    continue
+                # Срез до текущей точки t (без look-ahead)
+                X_slice = features_all.iloc[: t + 1]
+                y_slice = targets_by_H[H].iloc[: t + 1]
+                data = X_slice.join(y_slice, how="inner").dropna()
+                if len(data) < 200:
+                    continue
+                X = data.drop(columns=[y_slice.name])
+                y = data[y_slice.name]
+                x_now = x_now_full.reindex(columns=list(X.columns))
+
+                if include_xgb:
+                    try:
+                        fc, _ = forecast_xgboost(prices_t, X, y, x_now, H)
+                        predictions.setdefault(("XGBoost", H), []).append({
+                            "date": date_t, "p0": p0, "actual": actuals[H],
+                            "point": fc.point, "p10": fc.p10, "p90": fc.p90,
+                        })
+                    except Exception as exc:
+                        logger.warning("XGB t=%s H=%d failed: %s", date_t, H, exc)
+
+                if include_mlp:
+                    try:
+                        fc, _ = forecast_mlp(prices_t, X, y, x_now, H)
+                        predictions.setdefault(("MLP", H), []).append({
+                            "date": date_t, "p0": p0, "actual": actuals[H],
+                            "point": fc.point, "p10": fc.p10, "p90": fc.p90,
+                        })
+                    except Exception as exc:
+                        logger.warning("MLP t=%s H=%d failed: %s", date_t, H, exc)
+
+        if verbose and ((step_i + 1) % 5 == 0 or step_i == 0):
+            logger.info("  → %d / %d точек", step_i + 1, len(forecast_indices))
+        if progress_callback is not None:
+            try:
+                progress_callback(step_i + 1, len(forecast_indices))
+            except Exception:
+                pass
 
     # Считаем ансамбль: для каждого (H, date) усредняем доступные модели
     # Делаем по сводным DataFrame
