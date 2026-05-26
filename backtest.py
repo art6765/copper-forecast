@@ -18,11 +18,43 @@ from __future__ import annotations
 
 import logging
 import math
+import signal
 import warnings
+from contextlib import contextmanager
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+
+# ---------------------------------------------------------------------
+#  Таймаут на отдельные операции (защита от зависших ARIMA / др. fit'ов)
+# ---------------------------------------------------------------------
+
+class _OpTimeout(Exception):
+    """Срабатывает, если операция превысила лимит времени."""
+
+
+@contextmanager
+def _time_limit(seconds: int):
+    """Контекст-менеджер с таймаутом на Unix (SIGALRM).
+    На Windows таймаут не работает — выдаёт результат как есть.
+    Допустимо: Streamlit Cloud работает на Linux.
+    """
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handle(signum, frame):
+        raise _OpTimeout(f"operation exceeded {seconds}s")
+
+    old_handler = signal.signal(signal.SIGALRM, _handle)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 from models import (
     HORIZONS, HorizonForecast,
@@ -155,14 +187,16 @@ def walk_forward(raw_df: pd.DataFrame,
         if include_arima:
             try:
                 log_p = np.log(prices_t.tail(750).dropna())
-                fit = _ARIMA(log_p, order=(1, 1, 1),
-                              enforce_stationarity=False,
-                              enforce_invertibility=False).fit(
-                    method_kwargs={"warn_convergence": False}
-                )
-                forecast = fit.get_forecast(steps=max_horizon)
-                pred_mean = np.asarray(forecast.predicted_mean)
-                se_mean = np.asarray(forecast.se_mean)
+                # Жёсткий таймаут 8 сек: если ARIMA зависнет — переходим к fallback
+                with _time_limit(8):
+                    fit = _ARIMA(
+                        log_p, order=(1, 1, 1),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                    ).fit(method_kwargs={"warn_convergence": False, "maxiter": 50})
+                    forecast = fit.get_forecast(steps=max_horizon)
+                    pred_mean = np.asarray(forecast.predicted_mean)
+                    se_mean = np.asarray(forecast.se_mean)
                 for H in horizons_days:
                     mean_log = float(pred_mean[H - 1])
                     sigma_T = max(float(se_mean[H - 1]), 1e-9)
@@ -173,9 +207,12 @@ def walk_forward(raw_df: pd.DataFrame,
                         "date": date_t, "p0": p0, "actual": actuals[H],
                         "point": point, "p10": q["p10"], "p90": q["p90"],
                     })
-            except Exception as exc:
-                # Fallback: GBM-style для всех H
-                logger.warning("ARIMA t=%s failed (%s) → fallback GBM-style", date_t, exc)
+            except (_OpTimeout, Exception) as exc:
+                # Fallback: GBM-style для всех H (стандартное случайное блуждание)
+                if isinstance(exc, _OpTimeout):
+                    logger.warning("ARIMA t=%s: timeout → fallback GBM-style", date_t)
+                else:
+                    logger.warning("ARIMA t=%s failed (%s) → fallback GBM-style", date_t, exc)
                 from models import daily_drift
                 mu_d = daily_drift(prices_t, 60) * 0.5
                 for H in horizons_days:
@@ -211,22 +248,24 @@ def walk_forward(raw_df: pd.DataFrame,
 
                 if include_xgb:
                     try:
-                        fc, _ = forecast_xgboost(prices_t, X, y, x_now, H)
+                        with _time_limit(15):
+                            fc, _ = forecast_xgboost(prices_t, X, y, x_now, H)
                         predictions.setdefault(("XGBoost", H), []).append({
                             "date": date_t, "p0": p0, "actual": actuals[H],
                             "point": fc.point, "p10": fc.p10, "p90": fc.p90,
                         })
-                    except Exception as exc:
+                    except (_OpTimeout, Exception) as exc:
                         logger.warning("XGB t=%s H=%d failed: %s", date_t, H, exc)
 
                 if include_mlp:
                     try:
-                        fc, _ = forecast_mlp(prices_t, X, y, x_now, H)
+                        with _time_limit(15):
+                            fc, _ = forecast_mlp(prices_t, X, y, x_now, H)
                         predictions.setdefault(("MLP", H), []).append({
                             "date": date_t, "p0": p0, "actual": actuals[H],
                             "point": fc.point, "p10": fc.p10, "p90": fc.p90,
                         })
-                    except Exception as exc:
+                    except (_OpTimeout, Exception) as exc:
                         logger.warning("MLP t=%s H=%d failed: %s", date_t, H, exc)
 
         if verbose and ((step_i + 1) % 5 == 0 or step_i == 0):
