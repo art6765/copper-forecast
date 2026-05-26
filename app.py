@@ -824,29 +824,116 @@ with tab_bt:
                              yaxis_title="MAPE, %")
         st.plotly_chart(fig_bt, use_container_width=True)
 
-        # Detail: предсказания vs факт для одного горизонта
+        # ============================================================
+        # Detail: «Прогноз vs Факт» — на правильной календарной шкале
+        # ============================================================
         st.markdown("---")
-        H_select = st.selectbox("Горизонт для детального графика", [3, 10, 21, 63, 126])
-        M_select = st.selectbox("Модель",
-                                [m for m in bt["predictions"].keys()
-                                 if H_select in bt["predictions"][m]])
-        if M_select and H_select in bt["predictions"].get(M_select, {}):
-            d = bt["predictions"][M_select][H_select]
+        st.subheader("🎯 Прогноз vs Факт во времени")
+        st.caption(
+            "Линия факта — реальная цена меди за период бэк-теста. "
+            "Линия прогноза — то, что модель предсказывала бы из каждой точки в прошлом, "
+            "нарисованная на дате (t + H бизнес-дней), куда модель целилась."
+        )
+
+        all_models = list(bt["predictions"].keys())
+        col_d1, col_d2 = st.columns([1, 2])
+        with col_d1:
+            M_select = st.selectbox("Модель", all_models,
+                                     index=all_models.index("Ensemble") if "Ensemble" in all_models else 0)
+        with col_d2:
+            available_H = sorted({H for m in bt["predictions"].values() for H in m.keys()})
+            label_for_H = {3: "3 дня", 10: "10 дней", 21: "1 месяц",
+                            63: "3 месяца", 126: "6 месяцев"}
+            H_options = {label_for_H.get(H, f"{H} дн."): H for H in available_H}
+            H_multi_labels = st.multiselect(
+                "Горизонты прогноза (можно несколько)",
+                list(H_options.keys()),
+                default=[label_for_H[21]] if 21 in available_H else [list(H_options.keys())[0]],
+            )
+
+        if M_select and H_multi_labels:
+            color_palette = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e"]
+
             fig_d = go.Figure()
-            fig_d.add_trace(go.Scatter(x=d.index, y=d["actual"] * LB_PER_TON,
-                                       name="Факт", line=dict(color="black")))
-            fig_d.add_trace(go.Scatter(x=d.index, y=d["point"] * LB_PER_TON,
-                                       name="Прогноз", line=dict(color="red")))
-            fig_d.add_trace(go.Scatter(x=d.index, y=d["p10"] * LB_PER_TON,
-                                       name="p10", line=dict(color="red", dash="dot", width=1)))
-            fig_d.add_trace(go.Scatter(x=d.index, y=d["p90"] * LB_PER_TON,
-                                       name="p90", line=dict(color="red", dash="dot", width=1),
-                                       fill="tonexty", fillcolor="rgba(255,0,0,0.08)"))
-            fig_d.update_layout(height=420, hovermode="x unified",
-                                title=f"Прогноз vs факт, {M_select}, горизонт {H_select} дн.",
-                                margin=dict(l=10, r=10, t=40, b=10),
-                                yaxis_title="USD/t")
+
+            # 1. Чёрная линия — полная история цены меди
+            #    (это даёт «фон», где факт виден непрерывно)
+            fig_d.add_trace(go.Scatter(
+                x=raw.index, y=raw["copper"] * LB_PER_TON,
+                mode="lines", name="Факт (медь)",
+                line=dict(color="black", width=1.6),
+                hovertemplate="%{x|%Y-%m-%d}<br>%{y:,.0f} USD/т<extra>факт</extra>",
+            ))
+
+            # 2. Для каждого выбранного горизонта — линия прогноза
+            #    Сдвигаем по X на H бизнес-дней вперёд (точка прогноза = t+H)
+            for i, H_label in enumerate(H_multi_labels):
+                H = H_options[H_label]
+                if H not in bt["predictions"].get(M_select, {}):
+                    continue
+                d = bt["predictions"][M_select][H].copy()
+                # Смещаем индекс на H бизнес-дней вперёд (Bday — стандарт pandas)
+                shifted_index = d.index + pd.tseries.offsets.BDay(H)
+                col_c = color_palette[i % len(color_palette)]
+
+                # Затенение коридора p10-p90
+                fig_d.add_trace(go.Scatter(
+                    x=shifted_index, y=d["p90"] * LB_PER_TON,
+                    mode="lines", line=dict(color=col_c, width=0),
+                    showlegend=False, hoverinfo="skip",
+                ))
+                fig_d.add_trace(go.Scatter(
+                    x=shifted_index, y=d["p10"] * LB_PER_TON,
+                    mode="lines", line=dict(color=col_c, width=0),
+                    fill="tonexty",
+                    fillcolor=f"rgba({int(col_c[1:3],16)},{int(col_c[3:5],16)},{int(col_c[5:7],16)},0.10)",
+                    name=f"Коридор {H_label}",
+                    hoverinfo="skip",
+                ))
+                # Точечный прогноз — основная линия + маркеры
+                fig_d.add_trace(go.Scatter(
+                    x=shifted_index, y=d["point"] * LB_PER_TON,
+                    mode="lines+markers",
+                    name=f"Прогноз {H_label}",
+                    line=dict(color=col_c, width=2, dash="dot"),
+                    marker=dict(size=6, color=col_c, line=dict(color="white", width=1)),
+                    hovertemplate=(
+                        "Целевая дата: %{x|%Y-%m-%d}<br>"
+                        "Прогноз: %{y:,.0f} USD/т<extra>" + H_label + "</extra>"
+                    ),
+                ))
+
+            fig_d.update_layout(
+                height=520, hovermode="x unified",
+                title=f"Модель: {M_select}. Прогнозы на правильной календарной шкале (t + H).",
+                margin=dict(l=10, r=10, t=50, b=10),
+                xaxis_title="Дата",
+                yaxis_title="Цена меди, USD/т",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                             xanchor="right", x=1),
+            )
             st.plotly_chart(fig_d, use_container_width=True)
+
+            # Метрики для выбранной комбинации
+            st.markdown("**Метрики для выбранных горизонтов:**")
+            metrics_subset = bt["metrics"][
+                (bt["metrics"]["Модель"] == M_select) &
+                (bt["metrics"]["Дней"].isin([H_options[lbl] for lbl in H_multi_labels]))
+            ].round(2)
+            st.dataframe(metrics_subset, use_container_width=True, hide_index=True)
+
+            with st.expander("💡 Как читать этот график"):
+                st.markdown(
+                    "- **Чёрная линия** — реальная цена меди.\n"
+                    "- **Пунктирная цветная линия** — прогноз модели из разных точек прошлого, "
+                    "нарисованный на дате, **куда** модель целилась (`t + H` бизнес-дней).\n"
+                    "- **Затенённая лента** — коридор `p10-p90` вокруг прогноза.\n"
+                    "- Если пунктир **идёт рядом с чёрной линией** — модель работала хорошо.\n"
+                    "- Если пунктир **сильно расходится** — это эпизоды, где модель промахивалась "
+                    "(обычно вокруг шоков: Cobre Panamá, Escondida, тарифы).\n"
+                    "- Несколько горизонтов одновременно — видно, что **короткие горизонты** "
+                    "обычно следуют за фактом плотнее, чем длинные."
+                )
 
 
 # ----- TAB 4: Сырые данные -----
