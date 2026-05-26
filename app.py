@@ -120,33 +120,17 @@ def _safe_vline(fig, x, color="gray", dash="solid", width=1.0,
             fig.add_annotation(**ann_kwargs)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner="Запускаю back-test… (~30-90 сек)")
 def cached_backtest(years: int, train_min_days: int, step_days: int,
-                    use_xgb: bool, use_arima: bool,
-                    _progress_placeholder=None):
+                    use_xgb: bool, use_arima: bool):
     from backtest import walk_forward
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
-
-    # Прогресс-бар обновляется callback'ом из walk_forward
-    progress_bar = None
-    if _progress_placeholder is not None:
-        progress_bar = _progress_placeholder.progress(0, text="Запускаю back-test…")
-
-    def _on_progress(step, total):
-        if progress_bar is not None:
-            pct = int(step / total * 100)
-            progress_bar.progress(pct, text=f"Back-test: {step}/{total} точек ({pct}%)")
-
-    result = walk_forward(
+    return walk_forward(
         raw, train_min_days=train_min_days, step_days=step_days,
         include_xgb=use_xgb, include_arima=use_arima,
         include_gbm=True, verbose=False,
-        progress_callback=_on_progress,
     )
-    if progress_bar is not None:
-        progress_bar.empty()
-    return result
 
 
 # ============================================================
@@ -825,10 +809,8 @@ with tab_bt:
         st.caption("⏱ ~1-3 минуты на типичных параметрах")
 
     if run_bt:
-        progress_area = st.empty()
         bt = cached_backtest(years, int(bt_train_days), int(bt_step),
-                              use_xgb, use_arima,
-                              _progress_placeholder=progress_area)
+                              use_xgb, use_arima)
         st.success(f"Готово: {len(bt['metrics'])} строк метрик")
         st.dataframe(bt["metrics"].round(4),
                      use_container_width=True, hide_index=True)
