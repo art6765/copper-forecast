@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Cache данных (будут перегенерированы при первом запуске)
+data/cache_*.csv
+
+# Outputs (генерируются при запуске forecast.py)
+outputs/forecasts.csv
+outputs/backtest_metrics.csv
+outputs/history.csv
+outputs/plots/*.png
+
+# Macros
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Node (presentation builder)
+presentation/node_modules/
+presentation/package-lock.json
+presentation/Copper_Forecast_*.pdf
+
+# Logs
+*.log
+/tmp/
+
+# Streamlit Cloud runtime
+.cache/

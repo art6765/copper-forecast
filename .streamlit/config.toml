@@ -1,0 +1,31 @@
+# Конфигурация Streamlit для деплоя в Cloud
+# https://docs.streamlit.io/library/advanced-features/configuration
+
+[theme]
+# Тема: navy + copper, как в презентации
+base = "light"
+primaryColor = "#B87333"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F8FB"
+textColor = "#242938"
+font = "sans serif"
+
+[server]
+# Streamlit Cloud сам пробросит порт; для локального запуска оставим default
+headless = true
+runOnSave = false
+# Лимит upload — мы файлы не принимаем, ставим минимум
+maxUploadSize = 5
+
+[browser]
+# Не собирать статистику
+gatherUsageStats = false
+
+[client]
+# Скрыть лишние элементы UI
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[runner]
+# Скрипт перезапускается на каждое изменение виджета — стандарт
+fastReruns = true
