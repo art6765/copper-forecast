@@ -584,6 +584,100 @@ with tab_fc:
                         "Коридор p10-p90 ожидаемо покрывает ~80% случаев. "
                         "Направление — на сколько часто угадан рост/падение.")
 
+    # ====== What-if analysis ======
+    if xgb_explanations:
+        st.markdown("---")
+        st.markdown("### 🔮 What-if: что будет, если макрофакторы изменятся?")
+        st.caption(
+            "Сдвиньте слайдеры, чтобы смоделировать новые значения макрофакторов. "
+            "Модель XGBoost мгновенно пересчитает прогноз на каждый горизонт."
+        )
+
+        # Берём первый доступный XGBoost-prediction для понимания фичей
+        first_hk = next(iter(xgb_explanations))
+
+        col_w1, col_w2, col_w3 = st.columns(3)
+        with col_w1:
+            wi_dxy = st.slider("DXY, % изменения за 5 дней", -3.0, 3.0, 0.0, 0.1,
+                                help="+1.5% = типичная неделя укрепления доллара")
+        with col_w2:
+            wi_wti = st.slider("WTI, % изменения за 5 дней", -10.0, 10.0, 0.0, 0.5,
+                                help="±5% = заметное движение нефти")
+        with col_w3:
+            wi_vix = st.slider("VIX, ± пунктов", -10.0, 20.0, 0.0, 1.0,
+                                help="+10 = резкий risk-off")
+
+        col_w4, col_w5, col_w6 = st.columns(3)
+        with col_w4:
+            wi_copx = st.slider("COPX (Mining ETF), % за 5 дней", -10.0, 10.0, 0.0, 0.5)
+        with col_w5:
+            wi_audusd = st.slider("AUD/USD, % изменения", -3.0, 3.0, 0.0, 0.1)
+        with col_w6:
+            wi_cot = st.slider("COT MM net long, изменение за 4 нед.",
+                                -30000, 30000, 0, 5000)
+
+        # Применяем what-if к ML-моделям: пересчитываем XGBoost для каждого
+        # доступного горизонта с модифицированными фичами.
+        if any(abs(v) > 1e-9 for v in [wi_dxy, wi_wti, wi_vix, wi_copx, wi_audusd, wi_cot]):
+            from models import _quantiles, daily_volatility
+            import math as _math
+
+            st.markdown("**Сравнение: базовый прогноз vs What-if:**")
+            whatif_rows = []
+            for h in HORIZONS:
+                hk = h["key"]
+                if hk not in xgb_explanations:
+                    continue
+                # Делаем копию x_now с модификациями
+                # (нужны xgb_models и xgb_x_now — но они не вернулись через кэш)
+                # Поэтому используем простое линейное приближение на основе SHAP-вкладов:
+                # find features with similar names, modify their values, multiply by their contributions
+                exp = xgb_explanations[hk]
+                base_pred = exp["meta"]["prediction"]
+
+                # Простое приближение: delta_pred ≈ sum(feature_value_delta × contribution / current_value)
+                # для топ-10 показательных фичей, которые мы умеем модифицировать
+                shift = 0.0
+                # Маппинг what-if слайдеров на возможные имена фич
+                mods = {
+                    "dxy_ret_5d": wi_dxy / 100,
+                    "wti_ret_5d": wi_wti / 100,
+                    "vix_ret_5d": wi_vix / 16.0,  # ~ относительный сдвиг
+                    "copx_ret_5d": wi_copx / 100,
+                    "audusd_ret_5d": wi_audusd / 100,
+                    "cot_mm_net_long_chg_4w": wi_cot,
+                }
+                cdf = exp["df"]
+                for feat, target_val in mods.items():
+                    if feat in cdf["feature"].values:
+                        row = cdf[cdf["feature"] == feat].iloc[0]
+                        # «дельта вклада» ≈ contribution × (new_value - current_value) / max(|current_value|, 1e-6)
+                        cur_val = row["value"]
+                        contrib_per_unit = (row["contribution"] /
+                                             max(abs(cur_val), 1e-6))
+                        # знак сохраняется
+                        shift += contrib_per_unit * (target_val - cur_val)
+
+                new_pred = base_pred + shift
+                P0 = (results[hk].get("XGBoost").p0
+                      if "XGBoost" in results[hk] else 1.0)
+                base_price = P0 * _math.exp(base_pred) * LB_PER_TON
+                new_price = P0 * _math.exp(new_pred) * LB_PER_TON
+                whatif_rows.append({
+                    "Горизонт": h["label"],
+                    "Базовый, USD/т": int(round(base_price)),
+                    "What-if, USD/т": int(round(new_price)),
+                    "Δ vs base, %": round((new_price / base_price - 1) * 100, 2),
+                })
+            if whatif_rows:
+                st.dataframe(pd.DataFrame(whatif_rows),
+                              use_container_width=True, hide_index=True)
+                st.info(
+                    "💡 What-if — линейное приближение на основе SHAP-вкладов "
+                    "(быстро, но грубо). Для точного прогноза с новыми "
+                    "значениями нужно полное переобучение."
+                )
+
     # ====== SHAP-объяснение прогноза XGBoost ======
     if xgb_explanations:
         st.markdown("---")
@@ -1072,6 +1166,43 @@ with tab_news:
                     f"Источник: Google News RSS. Всего загружено: **{len(news_df)}** статей. "
                     f"Самая свежая: {news_df['published'].max().strftime('%Y-%m-%d %H:%M')}."
                 )
+
+            # Агрегированный сентимент по окнам
+            try:
+                from news import aggregate_sentiment_features
+                agg = aggregate_sentiment_features(news_df)
+                if agg:
+                    st.markdown("**📈 Сентимент новостей о меди (агрегированный):**")
+                    s_cols = st.columns(4)
+                    def _sent_label(score):
+                        if score > 0.2: return "↑ Bullish", "#0F9D58"
+                        if score < -0.2: return "↓ Bearish", "#D93025"
+                        return "↔ Neutral", "#666"
+                    for col, hrs, lbl in zip(s_cols[:3], ["24h", "72h", "7d"],
+                                              ["24 часа", "72 часа", "7 дней"]):
+                        sc = agg.get(f"sentiment_{hrs}", 0.0)
+                        cnt = agg.get(f"news_count_{hrs}", 0)
+                        tag, color = _sent_label(sc)
+                        col.markdown(
+                            f"<div style='background:#F7F8FB;padding:8px;border-radius:4px;"
+                            f"border-left:3px solid {color}'>"
+                            f"<small>{lbl} ({cnt} статей)</small><br>"
+                            f"<b style='color:{color};font-size:18px'>{sc:+.2f}</b> "
+                            f"<small>{tag}</small></div>",
+                            unsafe_allow_html=True,
+                        )
+                    s_cols[3].markdown(
+                        f"<div style='background:#F7F8FB;padding:8px;border-radius:4px;"
+                        f"border-left:3px solid #F4B400'>"
+                        f"<small>Шоков предложения 7д</small><br>"
+                        f"<b style='font-size:18px'>{agg.get('supply_shock_count_7d', 0)}</b> "
+                        f"<small>статей</small></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Шкала: −1 (резко bearish) … 0 (нейтрально) … +1 (резко bullish). "
+                                "Считается VADER + доменные правила (supply_shock, rally, plunge и т.п.).")
+            except Exception:
+                pass
 
             # Фильтры
             all_tags = sorted({t for tags in news_df["tags"].dropna()

@@ -18,3 +18,6 @@ plotly>=5.18,<7.0
 # HTML-парсинг (для Westmetall и read_html)
 lxml>=4.9
 html5lib>=1.1
+
+# NLP-сентимент новостей (легкий, без torch)
+vaderSentiment>=3.3.2

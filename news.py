@@ -121,6 +121,75 @@ def _classify(title: str, summary: str) -> List[str]:
     return tags
 
 
+# Правила доменного смещения сентимента к bullish/bearish для меди.
+# Применяются поверх VADER.
+COPPER_BULLISH_PATTERNS = [
+    r"\bsupply\s*(shock|cut|disrupt)", r"\bmine\s*(strike|closure|shutdown|halt)",
+    r"\b(deficit|shortage|tightness)\b", r"\b(rally|surge|jumps?|soars?)\b",
+    r"\brecord\s*high", r"\bstrong\s*demand", r"\b(stimulus|easing)\b",
+    r"\bbull(ish)?\b", r"\bbreakthrough", r"\bescalat",
+    r"\binflation\s*hedge",
+]
+COPPER_BEARISH_PATTERNS = [
+    r"\b(surplus|glut|oversupply)\b", r"\bdemand\s*(weak|slowdown|drop)",
+    r"\bplunges?\b|\bcrashes?\b|\btumbles?\b|\bslumps?\b",
+    r"\brecession", r"\bbear(ish)?\b", r"\b(hike|tighten)\b",
+    r"\bstrong\s*dollar", r"\bdxy\s*rises?", r"\bsmelter\s*ramp",
+]
+
+
+def _domain_bias(text: str) -> float:
+    """Возвращает доменное смещение от -1 (bearish) до +1 (bullish) для меди.
+    Простой подсчёт: bullish_hits - bearish_hits, нормированный."""
+    txt = text.lower()
+    bull = sum(1 for p in COPPER_BULLISH_PATTERNS if re.search(p, txt))
+    bear = sum(1 for p in COPPER_BEARISH_PATTERNS if re.search(p, txt))
+    if bull + bear == 0:
+        return 0.0
+    raw = (bull - bear) / (bull + bear)
+    return max(-1.0, min(1.0, raw))
+
+
+# Кэш VADER analyzer
+_vader_cache = None
+
+
+def _vader_analyzer():
+    global _vader_cache
+    if _vader_cache is None:
+        try:
+            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+            _vader_cache = SentimentIntensityAnalyzer()
+        except ImportError:
+            _vader_cache = False
+    return _vader_cache if _vader_cache is not False else None
+
+
+def _vader_compound(text: str) -> float:
+    """Compound-score VADER от -1 до +1. Если VADER недоступен — 0."""
+    an = _vader_analyzer()
+    if an is None:
+        return 0.0
+    return float(an.polarity_scores(text).get("compound", 0.0))
+
+
+def compute_sentiment(title: str, summary: str) -> dict:
+    """Полный sentiment-скоринг новости.
+    Возвращает {vader, domain, copper_score} — все в диапазоне [-1, +1].
+    copper_score = смесь VADER (40%) + доменного bias (60%) для отражения
+    специфики меди.
+    """
+    text = f"{title}. {summary}"
+    v = _vader_compound(text)
+    d = _domain_bias(text)
+    return {
+        "vader": round(v, 3),
+        "domain": round(d, 3),
+        # Доменный bias важнее общего VADER для специфики меди
+        "copper_score": round(0.4 * v + 0.6 * d, 3),
+    }
+
+
 def _strip_source(title: str) -> tuple[str, str]:
     """Google News заголовок вида 'Copper hits high - Reuters' → (заголовок, издание)."""
     if " - " in title:
@@ -156,7 +225,8 @@ def fetch_news_query(query: str, max_items: int = 50) -> List[NewsItem]:
             summary = summary[:400] + "…"
 
         title_clean, source = _strip_source(title_raw)
-        items.append(NewsItem(
+        sentiment = compute_sentiment(title_clean, summary)
+        ni = NewsItem(
             title=title_clean,
             link=link,
             published=pub,
@@ -164,7 +234,10 @@ def fetch_news_query(query: str, max_items: int = 50) -> List[NewsItem]:
             summary=summary,
             query=query,
             tags=_classify(title_clean, summary),
-        ))
+        )
+        # Добавим sentiment как атрибут (dataclass позволяет)
+        ni.__dict__.update(sentiment)
+        items.append(ni)
         if len(items) >= max_items:
             break
     return items
@@ -223,6 +296,36 @@ def news_between(df: pd.DataFrame, start: dt.date, end: dt.date) -> pd.DataFrame
         return df
     mask = (df["published"].dt.date >= start) & (df["published"].dt.date <= end)
     return df.loc[mask].sort_values("published", ascending=False)
+
+
+def aggregate_sentiment_features(news_df: pd.DataFrame) -> dict:
+    """Агрегированный сентимент по окнам — для подачи как фича модели.
+    Возвращает:
+      sentiment_24h, sentiment_72h, sentiment_7d — средние copper_score
+      news_count_24h, news_count_72h, news_count_7d
+      supply_shock_count_7d — спец-счётчик
+    Все привязано к now() (текущий момент).
+    """
+    if news_df.empty or "copper_score" not in news_df.columns:
+        return {}
+    now = pd.Timestamp.now()
+    out = {}
+    for hours, suffix in [(24, "24h"), (72, "72h"), (168, "7d")]:
+        win = news_df[news_df["published"] >= now - pd.Timedelta(hours=hours)]
+        if not win.empty:
+            out[f"sentiment_{suffix}"] = float(win["copper_score"].mean())
+            out[f"news_count_{suffix}"] = int(len(win))
+        else:
+            out[f"sentiment_{suffix}"] = 0.0
+            out[f"news_count_{suffix}"] = 0
+    # Спец-счётчик
+    week = news_df[news_df["published"] >= now - pd.Timedelta(days=7)]
+    if not week.empty and "tags" in week.columns:
+        out["supply_shock_count_7d"] = int(week["tags"].fillna("").apply(
+            lambda t: "supply_shock" in str(t)).sum())
+    else:
+        out["supply_shock_count_7d"] = 0
+    return out
 
 
 if __name__ == "__main__":
