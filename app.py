@@ -30,6 +30,10 @@ from models import (
     ensemble_forecast, forecast_at_point, actuals_after_point,
 )
 from events import EVENTS, events_in_range, events_to_dataframe
+from upcoming_events import (
+    get_upcoming_events, get_top_events,
+    events_to_dataframe as upcoming_to_dataframe,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -297,6 +301,30 @@ if "lme_stock_total" in raw.columns and raw["lme_stock_total"].notna().any():
     c7.metric("LME stocks",
                f"{int(raw['lme_stock_total'].dropna().iloc[-1]):,} т",
                f"{int(raw['lme_stock_change'].dropna().iloc[-1] if 'lme_stock_change' in raw.columns else 0):+,} т")
+
+# Плашка ТОП-3 предстоящих событий
+try:
+    top_events = get_top_events(n=3, days_ahead=30)
+    if top_events:
+        st.markdown("**📅 Ближайшие ключевые события рынка:**")
+        ev_cols = st.columns(len(top_events))
+        for col, ev in zip(ev_cols, top_events):
+            label = f"{ev.region} {ev.icon} {ev.title}"
+            days_str = (f"через {ev.days_until} дн." if ev.days_until > 0
+                          else "сегодня" if ev.days_until == 0
+                          else f"{-ev.days_until} дн. назад")
+            col.markdown(
+                f"<div style='background:#F7F8FB;border-left:4px solid {ev.color};"
+                f"padding:8px 12px;border-radius:4px;font-size:13px;'>"
+                f"<b style='color:{ev.color}'>{ev.importance.upper()}</b> · "
+                f"<span style='color:#555'>{ev.date} · {days_str}</span><br>"
+                f"<span style='color:#242938'>{label}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        st.caption("Полный календарь — во вкладке «📰 Новости и события» → «📅 Календарь».")
+except Exception:
+    pass
 
 st.markdown("---")
 
@@ -774,7 +802,79 @@ with tab_regimes:
 with tab_news:
     st.subheader("📰 Новости и события рынка меди")
 
-    sub_news, sub_events = st.tabs(["📡 Свежие новости (RSS)", "🗂️ Каталог событий 2020-2026"])
+    sub_calendar, sub_news, sub_events = st.tabs([
+        "📅 Календарь (предстоящие)",
+        "📡 Свежие новости (RSS)",
+        "🗂️ Каталог событий 2020-2026",
+    ])
+
+    # ---- Календарь предстоящих событий ----
+    with sub_calendar:
+        st.caption(
+            "Курируемый календарь регулярных и специальных событий, способных "
+            "повлиять на цену меди. Источник дат: расписания центробанков, "
+            "BLS, ICSG, корпоративные релизы."
+        )
+
+        col_c1, col_c2, col_c3 = st.columns([1, 1, 1])
+        with col_c1:
+            cal_days = st.slider("Горизонт, дней", 7, 180, 60, step=7)
+        with col_c2:
+            cal_min_imp = st.selectbox("Минимальная важность",
+                                         ["low", "medium", "high"], index=0)
+        with col_c3:
+            cal_types = st.multiselect(
+                "Типы событий",
+                ["rates", "data", "industry", "policy", "conference"],
+                default=[],
+            )
+
+        upcoming = get_upcoming_events(
+            days_ahead=int(cal_days),
+            min_importance=cal_min_imp,
+            types=cal_types if cal_types else None,
+        )
+        st.markdown(f"**Найдено: {len(upcoming)} событий**")
+
+        # Группировка по неделям, чтобы не выводить простыню
+        if upcoming:
+            df_upcoming = upcoming_to_dataframe(upcoming)
+            # Сделаем читаемую таблицу
+            display_df = df_upcoming[["Дата", "Дней", "Регион", "Тип",
+                                       "Важность", "Событие"]].copy()
+            display_df["Дней"] = display_df["Дней"].apply(
+                lambda d: f"через {d}" if d > 0 else "сегодня" if d == 0 else f"{-d} назад"
+            )
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Карточки для high-importance
+            high_imp = [e for e in upcoming if e.importance == "high"]
+            if high_imp:
+                st.markdown("---")
+                st.markdown("### 🚨 События с высокой важностью")
+                for ev in high_imp[:8]:
+                    with st.container(border=True):
+                        col_e1, col_e2 = st.columns([1, 5])
+                        with col_e1:
+                            st.markdown(f"### {ev.region} {ev.icon}")
+                            st.markdown(f"<small><b>{ev.date}</b></small>",
+                                          unsafe_allow_html=True)
+                            days_label = (f"через {ev.days_until} дн."
+                                          if ev.days_until > 0
+                                          else "сегодня" if ev.days_until == 0
+                                          else f"{-ev.days_until} дн. назад")
+                            st.markdown(
+                                f"<span style='color:{ev.color}; font-weight:bold'>"
+                                f"{ev.importance.upper()}</span><br>"
+                                f"<small>{days_label}</small>",
+                                unsafe_allow_html=True,
+                            )
+                        with col_e2:
+                            st.markdown(f"**{ev.title}**")
+                            st.caption(f"`{ev.type}`")
+                            st.write(ev.description)
+                            if ev.source:
+                                st.markdown(f"[🔗 Источник]({ev.source})")
 
     # ---- Свежие новости ----
     with sub_news:
