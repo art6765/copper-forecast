@@ -248,6 +248,39 @@ class XGBHorizonModel:
     def predict(self, x_now: pd.DataFrame) -> float:
         return float(self.model.predict(x_now[self.feature_names_])[0])
 
+    def explain(self, x_now: pd.DataFrame, top_n: int = 10):
+        """SHAP-style объяснение через встроенный pred_contribs XGBoost.
+        Не требует библиотеки shap.
+
+        Возвращает DataFrame:
+          feature | value | contribution | abs_contrib
+        Отсортирован по |contribution| убыванию, top_n строк.
+        + dict с 'baseline' (bias) и 'prediction' (сумма всех contribs).
+        """
+        import xgboost as xgb
+        x_aligned = x_now[self.feature_names_]
+        # Используем Booster.predict напрямую — нужно DMatrix
+        dmat = xgb.DMatrix(x_aligned.values, feature_names=self.feature_names_)
+        contribs = self.model.get_booster().predict(dmat, pred_contribs=True)
+        # contribs shape: (n_samples, n_features + 1), последний столбец = baseline
+        row = contribs[0]
+        baseline = float(row[-1])
+        feat_contribs = row[:-1]
+
+        df = pd.DataFrame({
+            "feature": self.feature_names_,
+            "value": x_aligned.iloc[0].values,
+            "contribution": feat_contribs,
+        })
+        df["abs_contrib"] = df["contribution"].abs()
+        df = df.sort_values("abs_contrib", ascending=False).head(top_n).reset_index(drop=True)
+
+        return df, {
+            "baseline": baseline,
+            "prediction": baseline + float(feat_contribs.sum()),
+            "total_features": len(self.feature_names_),
+        }
+
 
 def forecast_xgboost(prices: pd.Series,
                      X_train: pd.DataFrame, y_train: pd.Series,
@@ -361,6 +394,27 @@ def forecast_mlp(prices: pd.Series,
 
 DEFAULT_WEIGHTS = {"XGBoost": 0.4, "MLP": 0.2, "ARIMA": 0.25, "GBM": 0.15}
 
+# Адаптивные веса по режиму: в Calm доверяем ML, в Turbulent — консервативно
+ADAPTIVE_WEIGHTS = {
+    "calm":      {"XGBoost": 0.45, "MLP": 0.25, "ARIMA": 0.20, "GBM": 0.10},
+    "turbulent": {"XGBoost": 0.15, "MLP": 0.10, "ARIMA": 0.35, "GBM": 0.40},
+}
+
+
+def adaptive_weights_from_regime(calm_prob: float) -> Dict[str, float]:
+    """Линейная интерполяция весов между Calm и Turbulent по вероятности.
+
+    calm_prob = 0.0 → полный Turbulent
+    calm_prob = 1.0 → полный Calm
+    Промежуточные значения — линейное смешение, нормированное к сумме 1.
+    """
+    cw = ADAPTIVE_WEIGHTS["calm"]
+    tw = ADAPTIVE_WEIGHTS["turbulent"]
+    a = max(0.0, min(1.0, float(calm_prob)))
+    out = {k: a * cw[k] + (1 - a) * tw[k] for k in cw}
+    s = sum(out.values())
+    return {k: v / s for k, v in out.items()}
+
 
 def ensemble_forecast(forecasts: Dict[str, HorizonForecast],
                       weights: Optional[Dict[str, float]] = None) -> HorizonForecast:
@@ -395,9 +449,14 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
                           use_xgb: bool = True,
                           use_mlp: bool = True,
                           use_arima: bool = True,
-                          use_gbm: bool = True) -> Dict[str, Dict[str, HorizonForecast]]:
+                          use_gbm: bool = True,
+                          xgb_models_out: Optional[Dict] = None,
+                          xgb_x_now_out: Optional[Dict] = None) -> Dict[str, Dict[str, HorizonForecast]]:
     """Возвращает {horizon_key: {model_name: HorizonForecast}}.
     raw_df — результат data_loader.load_all().
+
+    Если переданы xgb_models_out и xgb_x_now_out — в них пишутся обученные
+    XGBoost-модели для каждого горизонта (для SHAP-объяснений).
     """
     from features import prepare_xy, build_features
 
@@ -439,8 +498,12 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
 
         if use_xgb and X is not None:
             try:
-                fc, _ = forecast_xgboost(prices, X, y, x_now_aligned, H)
+                fc, xgb_model = forecast_xgboost(prices, X, y, x_now_aligned, H)
                 horizon_results["XGBoost"] = fc
+                if xgb_models_out is not None:
+                    xgb_models_out[h["key"]] = xgb_model
+                if xgb_x_now_out is not None:
+                    xgb_x_now_out[h["key"]] = x_now_aligned
             except Exception as exc:
                 logger.warning("XGBoost h=%d failed: %s", H, exc)
 

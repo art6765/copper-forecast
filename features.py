@@ -25,7 +25,12 @@ LAGS_RET = [1, 2, 3, 5, 10, 20, 60]
 LAGS_PRICE = [1, 5, 20]
 SMA_WINDOWS = [5, 10, 20, 60]
 VOL_WINDOWS = [10, 20, 60]
-CROSS_ASSETS = ["dxy", "wti", "gold", "silver", "sp500", "us10y"]
+CROSS_ASSETS = [
+    "dxy", "wti", "gold", "silver", "sp500", "us10y",
+    "audusd", "usdclp", "usdcny",      # валюты горнодобыч. стран
+    "copx", "pick", "slx",              # mining ETFs
+    "vix", "bdry",                      # риск + логистика
+]
 
 
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:

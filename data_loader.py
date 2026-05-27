@@ -30,6 +30,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 TICKERS: Dict[str, str] = {
+    # --- Основа ---
     "HG=F":    "copper",      # COMEX Copper, USD/lb  (целевой ряд)
     "DX-Y.NYB": "dxy",        # US Dollar Index
     "CL=F":    "wti",         # WTI Crude
@@ -37,6 +38,20 @@ TICKERS: Dict[str, str] = {
     "SI=F":    "silver",      # Silver
     "^GSPC":   "sp500",       # S&P 500
     "^TNX":    "us10y",       # 10Y yield × 10
+
+    # --- Расширение: валюты горнодобывающих стран ---
+    "AUDUSD=X": "audusd",     # AUD/USD — Австралия (BHP, Rio Tinto)
+    "USDCLP=X": "usdclp",     # USD/CLP — Чили (главный производитель меди)
+    "CNY=X":    "usdcny",     # USD/CNY — Китай (главный потребитель)
+
+    # --- Mining ETFs (опережающий индикатор) ---
+    "COPX":     "copx",       # Global X Copper Miners
+    "PICK":     "pick",       # iShares Metals & Mining
+    "SLX":      "slx",        # VanEck Steel — proxy на индустриальный спрос
+
+    # --- Риск-аппетит и логистика ---
+    "^VIX":     "vix",        # CBOE Volatility Index — индекс страха
+    "BDRY":     "bdry",       # Breakwave Dry Bulk — Baltic Dry proxy
 }
 
 LB_PER_TON = 2204.62262  # перевод USD/lb -> USD/t

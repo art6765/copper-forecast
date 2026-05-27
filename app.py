@@ -28,6 +28,7 @@ from data_loader import load_all, LB_PER_TON
 from models import (
     forecast_all_horizons, forecasts_to_dataframe, HORIZONS,
     ensemble_forecast, forecast_at_point, actuals_after_point,
+    adaptive_weights_from_regime,
 )
 from events import EVENTS, events_in_range, events_to_dataframe
 from upcoming_events import (
@@ -54,10 +55,22 @@ def cached_forecast(_raw_signature: str, years: int,
     """raw_signature — служебная строка для invalidate кэша при изменении входов."""
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
+    xgb_models, xgb_x_now = {}, {}
     results = forecast_all_horizons(raw, use_xgb=use_xgb, use_mlp=use_mlp,
-                                    use_arima=use_arima, use_gbm=use_gbm)
+                                    use_arima=use_arima, use_gbm=use_gbm,
+                                    xgb_models_out=xgb_models,
+                                    xgb_x_now_out=xgb_x_now)
     df = forecasts_to_dataframe(results)
-    return raw, results, df
+    # Префектим SHAP-объяснение для каждого горизонта (быстро, миллисекунды)
+    explanations = {}
+    for hk, m in xgb_models.items():
+        if hk in xgb_x_now:
+            try:
+                contrib_df, meta = m.explain(xgb_x_now[hk], top_n=10)
+                explanations[hk] = {"df": contrib_df, "meta": meta}
+            except Exception:
+                pass
+    return raw, results, df, explanations
 
 
 @st.cache_data(ttl=3600, show_spinner="Идентифицирую режимы…")
@@ -78,9 +91,6 @@ def cached_forecast_at_point(_signature: str, years: int, as_of_iso: str,
     raw = load_all(start=start)
     as_of_requested = pd.Timestamp(as_of_iso)
 
-    # Слайдер возвращает любой день календаря (включая выходные).
-    # Снапим к ближайшему бизнес-дню ≤ выбранной даты, иначе get_loc упадёт
-    # на построении графика, и история нарисуется не от той точки.
     valid_dates = raw.index[raw.index <= as_of_requested]
     if len(valid_dates) == 0:
         raise ValueError(f"Нет торговых дней до {as_of_requested.date()}")
@@ -90,7 +100,7 @@ def cached_forecast_at_point(_signature: str, years: int, as_of_iso: str,
                                 use_arima=use_arima, use_gbm=use_gbm)
     actuals = actuals_after_point(raw, as_of)
     df = forecasts_to_dataframe(results)
-    return raw, results, df, actuals, as_of
+    return raw, results, df, actuals, as_of, {}  # пустые объяснения для is режима
 
 
 @st.cache_data(ttl=3600, show_spinner="Загружаю новости…")
@@ -161,10 +171,18 @@ use_arima = st.sidebar.checkbox("ARIMA(1,1,1)", value=True)
 use_gbm = st.sidebar.checkbox("GBM (статистический baseline)", value=True)
 
 st.sidebar.markdown("### Веса ансамбля")
-w_xgb = st.sidebar.slider("XGBoost", 0.0, 1.0, 0.4, step=0.05)
-w_mlp = st.sidebar.slider("MLP", 0.0, 1.0, 0.2, step=0.05)
-w_arima = st.sidebar.slider("ARIMA", 0.0, 1.0, 0.25, step=0.05)
-w_gbm = st.sidebar.slider("GBM", 0.0, 1.0, 0.15, step=0.05)
+adaptive = st.sidebar.checkbox(
+    "🎭 Адаптивные веса по режиму Markov",
+    value=True,
+    help="В Calm — больше веса XGBoost/MLP. В Turbulent — больше ARIMA/GBM. "
+         "Веса линейно интерполируются по вероятности текущего режима.",
+)
+if adaptive:
+    st.sidebar.caption("Слайдеры внизу игнорируются. Веса считаются автоматически из Markov-режима.")
+w_xgb = st.sidebar.slider("XGBoost", 0.0, 1.0, 0.4, step=0.05, disabled=adaptive)
+w_mlp = st.sidebar.slider("MLP", 0.0, 1.0, 0.2, step=0.05, disabled=adaptive)
+w_arima = st.sidebar.slider("ARIMA", 0.0, 1.0, 0.25, step=0.05, disabled=adaptive)
+w_gbm = st.sidebar.slider("GBM", 0.0, 1.0, 0.15, step=0.05, disabled=adaptive)
 
 refresh_data = st.sidebar.button("🔄 Обновить котировки")
 
@@ -203,10 +221,9 @@ historical_actuals: Dict[int, float] = {}
 historical_as_of: Optional[pd.Timestamp] = None
 
 if historical_mode:
-    # Слайдер выбора даты (в основной части main page, до прогноза)
-    min_date = raw.index.min().date() + dt.timedelta(days=210)   # минимум ~год обучения
-    max_date = raw.index.max().date() - dt.timedelta(days=10)     # хотя бы 10 дней «будущего»
-    default_date = max_date - dt.timedelta(days=150)              # по умолчанию полгода назад
+    min_date = raw.index.min().date() + dt.timedelta(days=210)
+    max_date = raw.index.max().date() - dt.timedelta(days=10)
+    default_date = max_date - dt.timedelta(days=150)
 
     st.warning(
         f"🕰️ **Режим исторической проверки.** Модели обучаются на данных до выбранной "
@@ -217,18 +234,16 @@ if historical_mode:
         min_value=min_date, max_value=max_date,
         value=default_date,
         format="YYYY-MM-DD",
-        help="Слайдер двигает «настоящее время» — модели видят только данные слева, "
-             "прогноз рисуется на 3д/10д/1м/3м/6м вперёд, а фактическое продолжение "
-             "цены — справа.",
+        help="Модели видят только данные слева, прогноз рисуется на 3д/10д/1м/3м/6м вперёд, "
+             "фактическое продолжение цены — справа.",
     )
     sig = (f"{raw.index.max().date()}_{len(raw)}_{years}_"
             f"{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}_AT_{as_of_choice}")
-    raw, results, df_fc, historical_actuals, historical_as_of = cached_forecast_at_point(
+    (raw, results, df_fc, historical_actuals,
+     historical_as_of, xgb_explanations) = cached_forecast_at_point(
         sig, years, as_of_choice.isoformat(),
         use_xgb, use_mlp, use_arima, use_gbm,
     )
-    # Если пользователь выбрал выходной/праздник — сообщим, на какую реальную
-    # торговую дату «снапнулся» прогноз.
     if historical_as_of.date() != as_of_choice:
         st.info(
             f"📅 {as_of_choice} — не торговый день. "
@@ -237,13 +252,34 @@ if historical_mode:
         )
 else:
     sig = f"{raw.index.max().date()}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}"
-    raw, results, df_fc = cached_forecast(sig, years, use_xgb, use_mlp, use_arima, use_gbm)
+    raw, results, df_fc, xgb_explanations = cached_forecast(
+        sig, years, use_xgb, use_mlp, use_arima, use_gbm
+    )
 
-# Применим пользовательские веса к ансамблю
+# Применим пользовательские или адаптивные веса к ансамблю
+def _get_active_weights() -> Dict[str, float]:
+    """Возвращает текущий набор весов: адаптивный или пользовательский."""
+    if adaptive:
+        # Достаём текущий режим (k=2). Используем кэш regimes, не считаем дважды.
+        try:
+            sig_r = f"{raw.index.max().date()}_{years}_2"
+            fit_quick, _ = cached_regimes(sig_r, k_regimes=2)
+            # Идентифицируем «calm» — режим с меньшей сигмой
+            sorted_by_sigma = fit_quick.params.sort_values("sigma")
+            calm_idx = sorted_by_sigma.index[0]
+            calm_prob = fit_quick.current_probs.get(calm_idx, 0.5)
+            return adaptive_weights_from_regime(calm_prob)
+        except Exception:
+            return {"XGBoost": 0.4, "MLP": 0.2, "ARIMA": 0.25, "GBM": 0.15}
+    return {"XGBoost": w_xgb, "MLP": w_mlp, "ARIMA": w_arima, "GBM": w_gbm}
+
+
+active_weights = _get_active_weights()
+
+
 def _custom_ensemble(results_local: Dict) -> Dict[str, dict]:
-    """Пересчитать ансамбль с пользовательскими весами."""
-    weights = {"XGBoost": w_xgb, "MLP": w_mlp, "ARIMA": w_arima, "GBM": w_gbm}
-    weights = {k: v for k, v in weights.items() if v > 0}
+    """Пересчитать ансамбль с текущими весами."""
+    weights = {k: v for k, v in active_weights.items() if v > 0}
     custom = {}
     for hk, models in results_local.items():
         models_present = {k: v for k, v in models.items() if k in weights}
@@ -290,7 +326,16 @@ try:
     fit_quick, _ = cached_regimes(f"{last_date}_{years}_2", k_regimes=2)
     label = fit_quick.label_map[fit_quick.current_regime]
     prob = fit_quick.current_probs[fit_quick.current_regime] * 100
-    c5.info(f"🎭 Текущий режим (Markov, k=2): **{label}** — {prob:.1f}%")
+    weights_str = ""
+    if adaptive:
+        w_show = " · ".join(f"{k}={int(v*100)}%" for k, v in active_weights.items())
+        weights_str = f"<br><small>⚙️ Веса ансамбля: {w_show}</small>"
+    c5.markdown(
+        f"<div style='background:#E7F0FE;padding:8px 12px;border-radius:4px;"
+        f"border-left:4px solid #1E2761;'>🎭 Текущий режим (Markov, k=2): "
+        f"<b>{label}</b> — {prob:.1f}%{weights_str}</div>",
+        unsafe_allow_html=True,
+    )
 except Exception:
     pass
 if "mm_net_long" in raw.columns and pd.notna(raw["mm_net_long"].iloc[-1]):
@@ -538,6 +583,69 @@ with tab_fc:
             st.caption(f"Модель: **{selected_model}**. "
                         "Коридор p10-p90 ожидаемо покрывает ~80% случаев. "
                         "Направление — на сколько часто угадан рост/падение.")
+
+    # ====== SHAP-объяснение прогноза XGBoost ======
+    if xgb_explanations:
+        st.markdown("---")
+        st.markdown("### 🔍 Почему такой прогноз? (XGBoost SHAP)")
+        st.caption(
+            "Какие факторы тянули прогноз вверх (зелёные) или вниз (красные). "
+            "Значения — вклад каждой фичи в лог-доходность горизонта."
+        )
+
+        hk_options = {h["label"]: h["key"] for h in HORIZONS
+                      if h["key"] in xgb_explanations}
+        if hk_options:
+            shap_h_label = st.selectbox(
+                "Горизонт для объяснения",
+                list(hk_options.keys()), index=2 if len(hk_options) > 2 else 0,
+            )
+            shap_hk = hk_options[shap_h_label]
+            exp = xgb_explanations[shap_hk]
+            cdf = exp["df"]
+            meta = exp["meta"]
+
+            col_s1, col_s2 = st.columns([2, 1])
+            with col_s1:
+                # Горизонтальный bar-chart вкладов
+                colors = ["#0F9D58" if c > 0 else "#D93025"
+                          for c in cdf["contribution"]]
+                fig_shap = go.Figure(go.Bar(
+                    y=cdf["feature"][::-1],
+                    x=cdf["contribution"][::-1],
+                    orientation="h",
+                    marker=dict(color=colors[::-1]),
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Значение: %{customdata:.4f}<br>"
+                        "Вклад: %{x:.5f}<extra></extra>"
+                    ),
+                    customdata=cdf["value"][::-1].values,
+                ))
+                fig_shap.add_vline(x=0, line=dict(color="gray", width=1))
+                fig_shap.update_layout(
+                    height=380, margin=dict(l=10, r=10, t=20, b=10),
+                    xaxis_title="Вклад в прогноз (лог-доходность)",
+                    yaxis=dict(automargin=True),
+                )
+                st.plotly_chart(fig_shap, use_container_width=True)
+
+            with col_s2:
+                st.metric("Базовый прогноз", f"{meta['baseline']:.5f}")
+                st.metric("Итог модели",
+                          f"{meta['prediction']:.5f}",
+                          delta=f"{(meta['prediction']-meta['baseline'])*100:.2f}% от baseline")
+                st.caption(f"Всего признаков в модели: {meta['total_features']}")
+                st.caption("Показано топ-10 по абсолютному вкладу.")
+
+            with st.expander("💡 Как читать"):
+                st.markdown(
+                    "- **Зелёные** бары — фичи тянут прогноз **вверх** (рост цены).\n"
+                    "- **Красные** — тянут **вниз** (снижение цены).\n"
+                    "- Длина = сила влияния (в лог-пространстве).\n"
+                    "- Hover показывает текущее значение фичи (например, `dxy_ret_5d = -0.012`).\n"
+                    "- Сумма всех вкладов + baseline = итоговый прогноз модели."
+                )
 
     # Раскрытие — детальная таблица по всем моделям
     with st.expander("📋 Детальные прогнозы всех моделей"):
