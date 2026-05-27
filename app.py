@@ -518,9 +518,18 @@ with tab_fc:
 
     # Горизонтальная линия P0 (точка прогноза)
     p0_for_plot = float(hist_full.iloc[idx_base]) * LB_PER_TON
-    # Горизонтальная линия P0 (add_hline работает — не использует Timestamp)
+    # Горизонтальная линия P0
     fig.add_hline(y=p0_for_plot, line=dict(color="gray", dash="dash", width=1),
                   annotation_text=f"P0 = {p0_for_plot:,.0f}", annotation_position="bottom right")
+    # Mining cost — «пол» цены меди (Wood Mackenzie 2024: 90-percentile C1 cost)
+    MINING_COST_90P = 5000   # USD/t, 90-percentile минимальная себестоимость
+    MINING_COST_50P = 3800   # USD/t, медианная (incl. by-product credits)
+    fig.add_hline(
+        y=MINING_COST_90P,
+        line=dict(color="#B85042", dash="dot", width=1.0),
+        annotation_text=f"Себестоимость 90% мин ≈ {MINING_COST_90P:,} (Wood Mackenzie)",
+        annotation_position="top left",
+    )
     # Вертикальная линия точки прогноза — через safe-helper
     _safe_vline(fig, x=last_d, color="gray", dash="dot", width=1,
                 annotation_text=f"as of {last_d.date()}")

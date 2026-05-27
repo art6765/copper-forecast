@@ -135,6 +135,78 @@ def daily_volatility(prices: pd.Series, window: int = 60) -> float:
     return float(log_ret.tail(window).std())
 
 
+def garch11_volatility(prices: pd.Series, horizon_days: int = 1) -> Tuple[float, dict]:
+    """GARCH(1,1) условная волатильность на h дней вперёд.
+
+    Модель: σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1},  α + β < 1.
+
+    Возвращает (σ_h, params):
+      σ_h     — оценка волатильности на h дней (стандартное отклонение лог-дох.)
+      params  — {'omega', 'alpha', 'beta', 'persistence', 'long_run_sigma'}
+
+    Если оптимизация не сходится — fallback на простой rolling std.
+    """
+    from scipy.optimize import minimize
+
+    ret = np.log(prices / prices.shift(1)).dropna().values
+    n = len(ret)
+    if n < 60:
+        return float(np.std(ret) * np.sqrt(horizon_days)), {}
+
+    def _neg_log_likelihood(theta):
+        omega, alpha, beta = theta
+        if omega <= 0 or alpha < 0 or beta < 0 or (alpha + beta) >= 0.999:
+            return 1e10
+        sigma2 = np.zeros(n)
+        sigma2[0] = np.var(ret)
+        for t in range(1, n):
+            sigma2[t] = omega + alpha * ret[t-1] ** 2 + beta * sigma2[t-1]
+        # log-likelihood без константы
+        ll = -0.5 * np.sum(np.log(sigma2) + ret ** 2 / sigma2)
+        return -ll
+
+    # Стартовые значения
+    var0 = np.var(ret)
+    x0 = [var0 * 0.05, 0.05, 0.9]
+    try:
+        res = minimize(_neg_log_likelihood, x0, method="L-BFGS-B",
+                        bounds=[(1e-8, None), (0, 0.5), (0.5, 0.999)],
+                        options={"maxiter": 100})
+        if not res.success:
+            raise RuntimeError("GARCH not converged")
+        omega, alpha, beta = res.x
+    except Exception:
+        return float(np.std(ret[-60:]) * np.sqrt(horizon_days)), {}
+
+    # Восстанавливаем последнюю σ²_t
+    sigma2 = np.zeros(n)
+    sigma2[0] = var0
+    for t in range(1, n):
+        sigma2[t] = omega + alpha * ret[t-1] ** 2 + beta * sigma2[t-1]
+    sigma2_now = sigma2[-1]
+
+    # Прогноз на h шагов вперёд:
+    # E[σ²_{t+h}] → long-run-variance при h→∞, иначе постепенный переход
+    long_run_var = omega / max(1 - alpha - beta, 1e-6)
+    sigma2_h_total = 0.0
+    sigma2_t = sigma2_now
+    for _ in range(horizon_days):
+        # рекурсивный прогноз дисперсии
+        sigma2_t = omega + (alpha + beta) * sigma2_t
+        sigma2_h_total += sigma2_t
+    # Итоговое σ для накопленной h-дневной доходности:
+    sigma_h = float(np.sqrt(sigma2_h_total))
+
+    return sigma_h, {
+        "omega": float(omega),
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "persistence": float(alpha + beta),
+        "long_run_sigma": float(np.sqrt(long_run_var)),
+        "current_sigma": float(np.sqrt(sigma2_now)),
+    }
+
+
 def daily_drift(prices: pd.Series, window: int = 60) -> float:
     log_ret = np.log(prices / prices.shift(1)).dropna()
     return float(log_ret.tail(window).mean()) if len(log_ret) else 0.0
@@ -144,16 +216,24 @@ def daily_drift(prices: pd.Series, window: int = 60) -> float:
 
 def forecast_gbm(prices: pd.Series, horizon_days: int,
                  vol_window: int = 60, drift_window: int = 60,
-                 drift_shrink: float = 0.5) -> HorizonForecast:
+                 drift_shrink: float = 0.5,
+                 use_garch: bool = True) -> HorizonForecast:
     """Geometric Brownian Motion baseline.
     Точечный прогноз = E[P_T] = P_0 * exp(mu_T + 0.5 * sigma_T^2).
-    drift_shrink: коэффициент усадки исторического дрифта к нулю (защита от хвостовых исторических трендов).
+    drift_shrink: коэффициент усадки исторического дрифта к нулю.
+    use_garch: использовать GARCH(1,1) условную волатильность вместо
+               простого rolling std. По умолчанию True.
     """
     p0 = float(prices.iloc[-1])
-    sigma_d = daily_volatility(prices, vol_window)
     mu_d = daily_drift(prices, drift_window) * drift_shrink
     mu_T = mu_d * horizon_days
-    sigma_T = sigma_d * math.sqrt(horizon_days)
+    if use_garch:
+        try:
+            sigma_T, _ = garch11_volatility(prices, horizon_days)
+        except Exception:
+            sigma_T = daily_volatility(prices, vol_window) * math.sqrt(horizon_days)
+    else:
+        sigma_T = daily_volatility(prices, vol_window) * math.sqrt(horizon_days)
     q = _quantiles(p0, mu_T, sigma_T)
     return HorizonForecast(
         label=str(horizon_days), days=horizon_days, model="GBM",
