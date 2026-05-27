@@ -285,7 +285,7 @@ const TOTAL = 17;
       weight: "10 %",  c: C.navy },
     { tag: "⑥", name: "Связанные товары",       why: "Нефть, золото, серебро",
       weight: "8 %",   c: C.navy },
-    { tag: "⑦", name: "Технические индикаторы", why: "RSI/MACD/ATR",
+    { tag: "⑦", name: "Технические + сезонность", why: "RSI/MACD + STL",
       weight: "7 %",   c: C.copper },
     { tag: "⑧", name: "Новости + сентимент",    why: "VADER + правила",
       weight: "5 %",   c: C.navy },
@@ -824,30 +824,34 @@ const TOTAL = 17;
   const tools = [
     {
       title: "🔍 SHAP: почему такой прогноз?",
-      desc: "На любой прогноз модель показывает топ-10 факторов, которые тянут цену вверх (зелёные) или вниз (красные). Видно вклад каждого: DXY, COT, RSI, корреляции.",
-      bullet: "Перестали верить «вслепую» — теперь решение опирается на видимые причины.",
+      desc: "Показывает топ-10 факторов, тянущих цену вверх/вниз: DXY, COT, RSI, корреляции. Не нужно верить «вслепую».",
     },
     {
       title: "🔮 What-if: симуляция сценариев",
-      desc: "6 слайдеров: DXY, нефть, VIX, Mining ETFs, юань, позиции хедж-фондов. Сдвиг — мгновенный пересчёт прогноза.",
-      bullet: "Проигрывайте «что если CPI выйдет горячее на 0.3 %» прямо в окне.",
+      desc: "6 слайдеров: DXY, нефть, VIX, Mining ETFs, юань, COT. Мгновенный пересчёт прогноза при сдвиге.",
     },
     {
       title: "🔥 Стресс-тесты",
-      desc: "5 готовых сценариев: Cobre Panamá, Escondida, тариф 30 %, COVID, China stimulus. Накладываем шок на текущий прогноз — видим downside.",
-      bullet: "Перед крупной закупкой — сразу видно худший сценарий.",
+      desc: "5 готовых сценариев из истории: Cobre Panamá, Escondida, тариф 30%, COVID, China stimulus. Сразу видно худший случай.",
     },
     {
       title: "📄 PDF-отчёт одной кнопкой",
-      desc: "Все ключевые метрики, прогноз на 5 горизонтов, события на месяц — в 1-2 страничном PDF.",
-      bullet: "Еженедельная отправка руководству — больше не задача на полдня.",
+      desc: "Ключевые метрики, прогноз на 5 горизонтов, события на месяц — в 1-2 страничный PDF для руководства.",
+    },
+    {
+      title: "🗓️ Сезонный анализ",
+      desc: "Heatmap годы×месяцы, STL-декомпозиция, сезонный прогноз. Бесплатная альтернатива Seasonax.",
+    },
+    {
+      title: "📅 Календарь событий + прогнозы",
+      desc: "FOMC, CPI, PMI с консенсусом аналитиков (CME FedWatch + Reuters). Бейдж влияния на медь — bullish/bearish.",
     },
   ];
 
   tools.forEach((t, i) => {
-    const col = i % 2, row = Math.floor(i / 2);
-    const x = 0.4 + col * 4.7, y = 1.4 + row * 1.85;
-    const w = 4.4, h = 1.7;
+    const col = i % 3, row = Math.floor(i / 3);
+    const x = 0.4 + col * 3.2, y = 1.4 + row * 1.85;
+    const w = 3.0, h = 1.7;
     s.addShape(pres.shapes.RECTANGLE, {
       x, y, w, h,
       fill: { color: C.cream }, line: { color: C.ice, width: 1 },
@@ -857,16 +861,12 @@ const TOTAL = 17;
       fill: { color: C.copper }, line: { color: C.copper },
     });
     s.addText(t.title, {
-      x: x + 0.18, y: y + 0.12, w: w - 0.3, h: 0.35,
-      fontSize: 14, bold: true, color: C.navy, fontFace: FONT, margin: 0,
+      x: x + 0.18, y: y + 0.12, w: w - 0.3, h: 0.5,
+      fontSize: 12, bold: true, color: C.navy, fontFace: FONT, margin: 0,
     });
     s.addText(t.desc, {
-      x: x + 0.18, y: y + 0.5, w: w - 0.3, h: 0.7,
-      fontSize: 10, color: C.charcoal, fontFace: FONT, margin: 0,
-    });
-    s.addText(`💡 ${t.bullet}`, {
-      x: x + 0.18, y: y + 1.22, w: w - 0.3, h: 0.4,
-      fontSize: 9.5, italic: true, color: C.copper, fontFace: FONT, margin: 0,
+      x: x + 0.18, y: y + 0.65, w: w - 0.3, h: 0.95,
+      fontSize: 9.5, color: C.charcoal, fontFace: FONT, margin: 0,
     });
   });
 
@@ -1118,7 +1118,7 @@ const TOTAL = 17;
   s.addText([
     { text: "Прогноз на 5 горизонтов + COMEX/LME",  options: { breakLine: true, color: C.charcoal } },
     { text: "8 групп показателей · 4 модели + адаптивные веса",      options: { breakLine: true, color: C.charcoal } },
-    { text: "SHAP-объяснение · What-if · стресс-тесты · PDF", options: { breakLine: true, color: C.charcoal } },
+    { text: "SHAP · What-if · стресс-тесты · PDF · сезонность", options: { breakLine: true, color: C.charcoal } },
     { text: "Календарь событий с консенсусом аналитиков", options: { color: C.charcoal } },
   ], {
     x: 0.7, y: 3.5, w: 4.0, h: 1.0,

@@ -31,6 +31,11 @@ from models import (
     adaptive_weights_from_regime,
 )
 from events import EVENTS, events_in_range, events_to_dataframe
+from seasonality import (
+    monthly_avg, monthly_heatmap, dow_avg, best_worst_months,
+    stl_decompose, event_study, event_study_by_type,
+    current_seasonal_forecast, MONTH_NAMES,
+)
 from upcoming_events import (
     get_upcoming_events, get_top_events,
     events_to_dataframe as upcoming_to_dataframe,
@@ -107,6 +112,24 @@ def cached_forecast_at_point(_signature: str, years: int, as_of_iso: str,
 def cached_news():
     from news import fetch_all_news
     return fetch_all_news(max_per_query=30, cache_ttl_min=60)
+
+
+@st.cache_data(ttl=3600, show_spinner="Анализирую сезонность…")
+def cached_seasonality(_raw_signature: str, years: int):
+    """Считает сезонные метрики на копии цен меди."""
+    start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
+    raw = load_all(start=start, include_cot=False, include_lme_stocks=False,
+                    include_lme_price=False, include_fred=False)
+    prices = raw["copper"].dropna()
+    return {
+        "prices": prices,
+        "monthly_avg": monthly_avg(prices),
+        "monthly_heatmap": monthly_heatmap(prices),
+        "dow_avg": dow_avg(prices),
+        "best_worst": best_worst_months(prices),
+        "stl": stl_decompose(prices, period=252),
+        "seasonal_forecast": current_seasonal_forecast(prices),
+    }
 
 
 def _safe_vline(fig, x, color="gray", dash="solid", width=1.0,
@@ -393,9 +416,9 @@ st.markdown("---")
 #  Tabs
 # ============================================================
 
-tab_fc, tab_macro, tab_cot, tab_regimes, tab_news, tab_bt, tab_raw = st.tabs(
+tab_fc, tab_macro, tab_cot, tab_regimes, tab_season, tab_news, tab_bt, tab_raw = st.tabs(
     ["📈 Прогноз", "🌐 История и макро", "📋 COT и запасы", "🎭 Режимы",
-     "📰 Новости и события", "🔍 Back-test", "📊 Сырые данные"]
+     "🗓️ Сезонность", "📰 Новости и события", "🔍 Back-test", "📊 Сырые данные"]
 )
 
 
@@ -1143,6 +1166,198 @@ with tab_regimes:
         st.plotly_chart(fig_r, use_container_width=True)
     except Exception as exc:
         st.error(f"Не удалось обучить Markov-switching: {exc}")
+
+
+# ----- TAB: Сезонность -----
+with tab_season:
+    st.subheader("🗓️ Сезонный анализ цены меди")
+    st.caption(
+        "Исторические паттерны: какие месяцы лучше/хуже, как ведёт себя цена "
+        "вокруг типичных событий. Бесплатная альтернатива Seasonax — на наших же данных."
+    )
+
+    try:
+        sig_seas = f"{raw.index.max().date()}_{years}_seasonality"
+        seas = cached_seasonality(sig_seas, years)
+    except Exception as exc:
+        st.error(f"Сезонный анализ не удался: {exc}")
+        seas = None
+
+    if seas is not None:
+        best, worst = seas["best_worst"]
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Лучший месяц (среднее)", best)
+        col_s2.metric("Худший месяц (среднее)", worst)
+        col_s3.metric("Глубина истории", f"{years} лет")
+
+        # --- 1. Heatmap годы × месяцы ---
+        st.markdown("### 📅 Тепловая карта месячной доходности")
+        st.caption("Зелёное — рост, красное — снижение. Видно повторяющиеся паттерны года в год.")
+        hm = seas["monthly_heatmap"]
+        import plotly.express as px
+        fig_hm = px.imshow(
+            hm.values, x=hm.columns, y=hm.index,
+            color_continuous_scale=["#D93025", "#F5F5F5", "#0F9D58"],
+            color_continuous_midpoint=0,
+            aspect="auto",
+            labels={"x": "Месяц", "y": "Год", "color": "Доходность, %"},
+            text_auto=".1f",
+        )
+        fig_hm.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+        # --- 2. Среднее по месяцам ---
+        col_l, col_r = st.columns([2, 1])
+        with col_l:
+            st.markdown("### 📊 Средняя доходность по месяцам")
+            mavg = seas["monthly_avg"].copy()
+            colors = ["#0F9D58" if v > 0 else "#D93025" for v in mavg["Среднее, %"]]
+            fig_m = go.Figure(go.Bar(
+                x=mavg.index, y=mavg["Среднее, %"],
+                marker_color=colors,
+                text=[f"{v:+.1f}%" for v in mavg["Среднее, %"]],
+                textposition="outside",
+            ))
+            fig_m.add_hline(y=0, line=dict(color="gray", width=0.5))
+            fig_m.update_layout(height=350, margin=dict(l=10, r=10, t=20, b=10),
+                                  yaxis_title="Среднее, %")
+            st.plotly_chart(fig_m, use_container_width=True)
+        with col_r:
+            st.markdown("### 📋 По месяцам — таблица")
+            st.dataframe(mavg.round(2), use_container_width=True)
+
+        # --- 3. Day-of-week ---
+        st.markdown("### 📆 Эффект дня недели")
+        dow = seas["dow_avg"]
+        col_dl, col_dr = st.columns([2, 1])
+        with col_dl:
+            colors_d = ["#0F9D58" if v > 0 else "#D93025" for v in dow["Среднее, %"]]
+            fig_d = go.Figure(go.Bar(
+                x=dow.index, y=dow["Среднее, %"],
+                marker_color=colors_d,
+                text=[f"{v:+.3f}%" for v in dow["Среднее, %"]],
+                textposition="outside",
+            ))
+            fig_d.add_hline(y=0, line=dict(color="gray", width=0.5))
+            fig_d.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10),
+                                  yaxis_title="Среднее, %")
+            st.plotly_chart(fig_d, use_container_width=True)
+        with col_dr:
+            st.dataframe(dow.round(3), use_container_width=True)
+            st.caption("Это просто статистическое наблюдение, эффект мелкий "
+                       "(на уровне шума). Не торговый сигнал.")
+
+        # --- 4. STL декомпозиция ---
+        st.markdown("### 🌊 STL-декомпозиция: тренд + сезонность + шум")
+        st.caption(
+            "Цена меди разложена на 3 компоненты. **Сезонная** компонента "
+            "показывает, насколько текущая цена отклоняется от своего «нормального» "
+            "значения для данного месяца года."
+        )
+        stl = seas["stl"]
+        fig_stl = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                                  vertical_spacing=0.06,
+                                  subplot_titles=("Тренд (log price)",
+                                                  "Сезонная компонента (год)",
+                                                  "Остаток (шум)"))
+        fig_stl.add_trace(go.Scatter(x=stl.trend.index, y=stl.trend.values,
+                                       line=dict(color="#1A1A1A"), name="Trend"),
+                            row=1, col=1)
+        fig_stl.add_trace(go.Scatter(x=stl.seasonal.index, y=stl.seasonal.values * 100,
+                                       line=dict(color="#C8102E"), name="Seasonal %"),
+                            row=2, col=1)
+        fig_stl.add_hline(y=0, line=dict(color="gray", width=0.5), row=2, col=1)
+        fig_stl.add_trace(go.Scatter(x=stl.residual.index, y=stl.residual.values * 100,
+                                       line=dict(color="#5C5C5C"), name="Residual %"),
+                            row=3, col=1)
+        fig_stl.add_hline(y=0, line=dict(color="gray", width=0.5), row=3, col=1)
+        fig_stl.update_layout(height=540, margin=dict(l=10, r=10, t=40, b=10),
+                                showlegend=False, hovermode="x unified")
+        st.plotly_chart(fig_stl, use_container_width=True)
+        cur_seasonal = float(stl.seasonal.iloc[-1]) * 100
+        st.markdown(
+            f"**Текущая сезонная компонента: `{cur_seasonal:+.2f} %`**  "
+            f"— это значит, что цена сейчас "
+            + ("**выше**" if cur_seasonal > 0 else "**ниже**")
+            + " своего «среднего сезонного» уровня на эту величину."
+        )
+
+        # --- 5. Сезонный прогноз ---
+        st.markdown("### 🔮 Сезонный прогноз — что было в эти же дни в прошлом")
+        st.caption(
+            "Для каждого горизонта берём интервал (сегодня → +H дней) в прошлые "
+            f"{years} лет и считаем среднюю доходность. Это **только** сезонная "
+            "оценка, без учёта макро и фундаментала."
+        )
+        sf = seas["seasonal_forecast"]
+        rows_sf = []
+        p0 = float(seas["prices"].iloc[-1])
+        for H, info in sf.items():
+            if info is None:
+                continue
+            label = {3: "3 дня", 10: "10 дней", 21: "1 месяц",
+                       63: "3 месяца", 126: "6 месяцев"}.get(H, f"{H}д")
+            rows_sf.append({
+                "Горизонт": label,
+                "P0, USD/lb": f"{p0:.4f}",
+                "Сезонный прогноз, USD/lb": f"{info['point_price']:.4f}",
+                "Сезонная Δ, %": f"{info['change_pct']:+.2f}",
+                "Лет в выборке": info["n_years"],
+            })
+        if rows_sf:
+            st.dataframe(pd.DataFrame(rows_sf), use_container_width=True,
+                          hide_index=True)
+        st.caption(
+            "**Как использовать:** сравните сезонный прогноз с прогнозом модели "
+            "из вкладки «📈 Прогноз». Если оба указывают в одну сторону — "
+            "уверенность выше. Если расходятся — модель учитывает уникальные "
+            "факторы текущего момента."
+        )
+
+        # --- 6. Event study на каталоге событий ---
+        st.markdown("### 📌 Event study — поведение цены вокруг событий из каталога")
+        st.caption(
+            "Усреднённое поведение цены меди в окне ±30 дней вокруг событий "
+            "из нашего каталога. Группировка по типу события."
+        )
+        try:
+            es_by_type = event_study_by_type(seas["prices"], EVENTS,
+                                              before=15, after=45)
+            type_labels = {
+                "supply_shock": "⛏️ Шоки предложения",
+                "demand_shock": "🏭 Шоки спроса",
+                "policy": "📜 Политика и тарифы",
+                "macro": "💱 Макро (ФРС, ставки)",
+                "geopolitical": "🌍 Геополитика",
+                "structural": "🔄 Структурные сдвиги",
+            }
+            fig_es = go.Figure()
+            for t, df_es in es_by_type.items():
+                if df_es.empty:
+                    continue
+                fig_es.add_trace(go.Scatter(
+                    x=df_es["day"], y=(df_es["avg_price"] - 1) * 100,
+                    mode="lines", name=f"{type_labels.get(t, t)} (n={int(df_es['n_events'].max())})",
+                    line=dict(width=2),
+                ))
+            fig_es.add_vline(x=0, line=dict(color="gray", dash="dash"))
+            fig_es.add_hline(y=0, line=dict(color="gray", width=0.5))
+            fig_es.update_layout(
+                height=420, hovermode="x unified",
+                margin=dict(l=10, r=10, t=20, b=10),
+                xaxis_title="Дней от события (день 0 = событие)",
+                yaxis_title="Изменение цены от события, %",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+            )
+            st.plotly_chart(fig_es, use_container_width=True)
+            st.caption(
+                "**Чтение графика:** в день 0 произошло событие, цена нормирована = 0. "
+                "Линия показывает, **в среднем по всем событиям данного типа**, как "
+                "цена двигалась в последующие 45 дней. Например, после **шоков "
+                "предложения** цена обычно растёт, после **макро-событий** — падает."
+            )
+        except Exception as exc:
+            st.warning(f"Event study не построен: {exc}")
 
 
 # ----- TAB: Новости и события -----
