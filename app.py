@@ -1658,9 +1658,24 @@ with tab_bt:
         run_bt = st.button("▶️ Запустить back-test")
         st.caption("⏱ ~1-3 минуты на типичных параметрах")
 
+    # Сохраняем результат бэк-теста в session_state, чтобы он переживал
+    # перезагрузку страницы при изменении виджетов «Модель» / «Горизонты».
     if run_bt:
         bt = cached_backtest(years, int(bt_train_days), int(bt_step),
                               use_xgb, use_arima)
+        st.session_state["bt_result"] = bt
+        st.session_state["bt_params"] = (years, int(bt_train_days), int(bt_step),
+                                          use_xgb, use_arima)
+
+    bt = st.session_state.get("bt_result")
+    if bt is not None:
+        # Если параметры (years, шаг, ...) изменились — подсказка, что нужно
+        # перезапустить
+        cur_params = (years, int(bt_train_days), int(bt_step), use_xgb, use_arima)
+        if st.session_state.get("bt_params") != cur_params:
+            st.warning("⚠️ Параметры поменялись после запуска. Нажмите "
+                        "«Запустить back-test» снова, чтобы пересчитать.")
+
         st.success(f"Готово: {len(bt['metrics'])} строк метрик")
         st.dataframe(bt["metrics"].round(4),
                      use_container_width=True, hide_index=True)
@@ -1690,8 +1705,11 @@ with tab_bt:
         all_models = list(bt["predictions"].keys())
         col_d1, col_d2 = st.columns([1, 2])
         with col_d1:
-            M_select = st.selectbox("Модель", all_models,
-                                     index=all_models.index("Ensemble") if "Ensemble" in all_models else 0)
+            M_select = st.selectbox(
+                "Модель", all_models,
+                index=all_models.index("Ensemble") if "Ensemble" in all_models else 0,
+                key="fvf_model",   # сохраняем выбор в session_state
+            )
         with col_d2:
             available_H = sorted({H for m in bt["predictions"].values() for H in m.keys()})
             label_for_H = {3: "3 дня", 10: "10 дней", 21: "1 месяц",
@@ -1701,6 +1719,7 @@ with tab_bt:
                 "Горизонты прогноза (можно несколько)",
                 list(H_options.keys()),
                 default=[label_for_H[21]] if 21 in available_H else [list(H_options.keys())[0]],
+                key="fvf_horizons",   # сохраняем выбор в session_state
             )
 
         if M_select and H_multi_labels:
