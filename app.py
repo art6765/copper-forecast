@@ -72,7 +72,16 @@ def cached_forecast_at_point(_signature: str, years: int, as_of_iso: str,
                               use_arima: bool, use_gbm: bool):
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
-    as_of = pd.Timestamp(as_of_iso)
+    as_of_requested = pd.Timestamp(as_of_iso)
+
+    # Слайдер возвращает любой день календаря (включая выходные).
+    # Снапим к ближайшему бизнес-дню ≤ выбранной даты, иначе get_loc упадёт
+    # на построении графика, и история нарисуется не от той точки.
+    valid_dates = raw.index[raw.index <= as_of_requested]
+    if len(valid_dates) == 0:
+        raise ValueError(f"Нет торговых дней до {as_of_requested.date()}")
+    as_of = valid_dates.max()
+
     results = forecast_at_point(raw, as_of, use_xgb=use_xgb, use_mlp=use_mlp,
                                 use_arima=use_arima, use_gbm=use_gbm)
     actuals = actuals_after_point(raw, as_of)
@@ -214,6 +223,14 @@ if historical_mode:
         sig, years, as_of_choice.isoformat(),
         use_xgb, use_mlp, use_arima, use_gbm,
     )
+    # Если пользователь выбрал выходной/праздник — сообщим, на какую реальную
+    # торговую дату «снапнулся» прогноз.
+    if historical_as_of.date() != as_of_choice:
+        st.info(
+            f"📅 {as_of_choice} — не торговый день. "
+            f"Прогноз построен на ближайшую предыдущую торговую дату: "
+            f"**{historical_as_of.date()}**."
+        )
 else:
     sig = f"{raw.index.max().date()}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}"
     raw, results, df_fc = cached_forecast(sig, years, use_xgb, use_mlp, use_arima, use_gbm)
