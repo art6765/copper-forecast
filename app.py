@@ -426,6 +426,79 @@ with tab_fc:
         st.markdown("**🎯 Сводный ансамбль (с вашими весами)**")
         st.dataframe(ens_df, use_container_width=True, hide_index=True)
 
+        # === PDF + стресс-тесты + прогнозы инвестбанков ===
+        col_pdf, col_stress = st.columns([1, 2])
+
+        with col_pdf:
+            if st.button("📄 Сгенерировать PDF-отчёт"):
+                try:
+                    from report import generate_pdf_report
+                    from upcoming_events import get_top_events
+                    top5 = get_top_events(5, 30)
+                    try:
+                        fit_quick_r, _ = cached_regimes(f"{last_date}_{years}_2", 2)
+                        reg_label = fit_quick_r.label_map[fit_quick_r.current_regime]
+                        reg_prob = fit_quick_r.current_probs[fit_quick_r.current_regime] * 100
+                    except Exception:
+                        reg_label, reg_prob = "—", 0
+                    pdf_bytes = generate_pdf_report(
+                        raw_df=raw, forecasts_df=df_fc,
+                        regime_label=reg_label, regime_prob=reg_prob,
+                        top_events=top5, weights=active_weights,
+                    )
+                    st.download_button(
+                        "💾 Скачать PDF",
+                        data=pdf_bytes,
+                        file_name=f"copper_forecast_{dt.date.today()}.pdf",
+                        mime="application/pdf",
+                    )
+                except Exception as exc:
+                    st.error(f"Ошибка PDF: {exc}")
+
+        with col_stress:
+            with st.expander("🔥 Стресс-тесты и прогнозы инвестбанков"):
+                st.markdown("**Прогнозы крупных инвестбанков** _(публичные оценки):_")
+                ib_data = [
+                    {"Банк": "Goldman Sachs",  "2026 average, USD/т": 11400, "2027 target, USD/т": 12500},
+                    {"Банк": "Bank of America", "2026 average, USD/т": 11313, "2027 target, USD/т": 13501},
+                    {"Банк": "Citi",            "2026 average, USD/т": 11000, "2027 target, USD/т": 12000},
+                    {"Банк": "Morgan Stanley",  "2026 average, USD/т": 10800, "2027 target, USD/т": 11500},
+                ]
+                st.dataframe(pd.DataFrame(ib_data),
+                              use_container_width=True, hide_index=True)
+                avg_2026 = sum(b["2026 average, USD/т"] for b in ib_data) / len(ib_data)
+                current_ens_6m = rows[-1]["Точечный, USD/t"] if rows else None
+                if current_ens_6m:
+                    delta = (current_ens_6m / avg_2026 - 1) * 100
+                    st.caption(f"Средний прогноз банков на 2026: **{avg_2026:,.0f}** USD/т. "
+                                f"Наш ансамбль на 6 мес: **{current_ens_6m:,}** ({delta:+.1f}% от среднего).")
+
+                st.markdown("---")
+                st.markdown("**Стресс-тесты — повторение известного шока:**")
+                stress_scenarios = {
+                    "Cobre Panamá (−330 кт)":            -8.0,
+                    "Escondida-style strike":            -4.0,
+                    "Тариф Трампа 30% (премия COMEX)":  +12.0,
+                    "COVID-style demand shock":         -26.0,
+                    "China stimulus / V-recovery":      +15.0,
+                }
+                base = current_ens_6m or p_t
+                stress_rows = []
+                for name, pct in stress_scenarios.items():
+                    new_p = base * (1 + pct / 100)
+                    stress_rows.append({
+                        "Сценарий": name,
+                        "Δ %": f"{pct:+.1f}",
+                        "Новая цена, USD/т": int(round(new_p)),
+                        "Vs базовый": f"{int(new_p - base):+,}",
+                    })
+                st.dataframe(pd.DataFrame(stress_rows),
+                              use_container_width=True, hide_index=True)
+                st.caption(
+                    "Простые мультипликаторы из исторических аналогов. "
+                    "Себестоимость 90% мин ≈ 5000 USD/т ограничивает падение."
+                )
+
     # График: история + веер прогнозов
     st.markdown("**График прогноза**")
 

@@ -21,3 +21,6 @@ html5lib>=1.1
 
 # NLP-сентимент новостей (легкий, без torch)
 vaderSentiment>=3.3.2
+
+# PDF-отчёт
+reportlab>=4.0
