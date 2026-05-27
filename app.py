@@ -884,6 +884,54 @@ with tab_macro:
         st.caption("Вертикальные цветные линии — критические/высокие события "
                     "(severity ≥ high) из каталога. См. вкладку «📰 Новости и события».")
 
+    # ====== Карта производства меди ======
+    st.markdown("---")
+    st.markdown("### 🌍 Производство меди по странам — карта горячих точек")
+    st.caption("Источник: USGS Mineral Commodity Summaries 2026.")
+
+    # Топ-15 стран по добыче меди (USGS 2026, тыс. т)
+    production_data = {
+        "country_iso": ["CHL", "PER", "COD", "CHN", "USA", "AUS", "RUS",
+                         "ZMB", "MEX", "KAZ", "CAN", "IDN", "POL", "MNG", "ESP"],
+        "country_name": ["Чили", "Перу", "ДРК", "Китай", "США", "Австралия",
+                          "Россия", "Замбия", "Мексика", "Казахстан", "Канада",
+                          "Индонезия", "Польша", "Монголия", "Испания"],
+        "production_kt": [5300, 2700, 2400, 1900, 1100, 950, 920,
+                           850, 700, 650, 560, 540, 390, 320, 290],
+        "share_pct":    [22.4, 11.4, 10.1, 8.0, 4.6, 4.0, 3.9,
+                          3.6, 3.0, 2.7, 2.4, 2.3, 1.6, 1.4, 1.2],
+    }
+    prod_df = pd.DataFrame(production_data)
+
+    fig_map = go.Figure(go.Choropleth(
+        locations=prod_df["country_iso"],
+        z=prod_df["production_kt"],
+        text=prod_df["country_name"] + ": " +
+              prod_df["production_kt"].astype(str) + " кт (" +
+              prod_df["share_pct"].astype(str) + "%)",
+        colorscale=[
+            [0, "#F7F8FB"], [0.3, "#E8A87C"],
+            [0.6, "#B87333"], [1, "#1E2761"],
+        ],
+        colorbar=dict(title="кт/год"),
+        hovertemplate="%{text}<extra></extra>",
+    ))
+    fig_map.update_layout(
+        height=400, margin=dict(l=10, r=10, t=10, b=10),
+        geo=dict(showframe=False, projection_type="natural earth"),
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+
+    col_p1, col_p2 = st.columns([2, 1])
+    with col_p1:
+        st.markdown("**ТОП-10 стран-производителей**")
+        st.dataframe(prod_df.head(10), use_container_width=True, hide_index=True)
+    with col_p2:
+        top5_total = prod_df.head(5)["share_pct"].sum()
+        st.metric("Доля топ-5", f"{top5_total:.1f}%")
+        st.metric("Чили + Перу", f"{prod_df.iloc[0:2]['share_pct'].sum():.1f}%")
+        st.caption("Сильная концентрация: топ-5 стран дают больше половины мирового производства.")
+
     # ====== COMEX vs LME 3M (если есть данные) ======
     if "lme_3m" in raw.columns and raw["lme_3m"].notna().sum() > 5:
         st.markdown("---")

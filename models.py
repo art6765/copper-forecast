@@ -328,6 +328,18 @@ class XGBHorizonModel:
     def predict(self, x_now: pd.DataFrame) -> float:
         return float(self.model.predict(x_now[self.feature_names_])[0])
 
+    def conformal_quantiles(self, X_val: pd.DataFrame, y_val: pd.Series,
+                              alphas=(0.10, 0.25, 0.75, 0.90)) -> Dict[float, float]:
+        """Split-conformal: эмпирические квантили остатков на validation.
+        Применяются как смещение к точечному прогнозу:
+          q_α = mu + r_α, где r_α — α-квантиль остатков y_val - pred_val.
+        Это даёт калиброванные интервалы без normality-assumption.
+        """
+        pred = self.model.predict(X_val[self.feature_names_])
+        resid = y_val.values - pred
+        return {a: float(np.quantile(resid, a)) for a in alphas}
+
+
     def explain(self, x_now: pd.DataFrame, top_n: int = 10):
         """SHAP-style объяснение через встроенный pred_contribs XGBoost.
         Не требует библиотеки shap.
@@ -360,6 +372,79 @@ class XGBHorizonModel:
             "prediction": baseline + float(feat_contribs.sum()),
             "total_features": len(self.feature_names_),
         }
+
+
+class XGBQuantileModel:
+    """Отдельные XGBoost-модели для квантилей p10/p25/p75/p90.
+    Использует objective='reg:quantileerror' (требует XGBoost >= 2.0).
+    Это даёт **асимметричные** коридоры — лучше для скошенных распределений.
+    """
+    QUANTILES = [0.10, 0.25, 0.75, 0.90]
+
+    def __init__(self, **xgb_params):
+        from xgboost import XGBRegressor
+        self.models: Dict[float, "XGBRegressor"] = {}
+        self.feature_names_: Optional[List[str]] = None
+        self.xgb_params = dict(
+            n_estimators=200,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_lambda=1.0,
+            min_child_weight=5,
+            tree_method="hist",
+            random_state=42,
+            verbosity=0,
+        )
+        self.xgb_params.update(xgb_params)
+
+    def fit(self, X: pd.DataFrame, y: pd.Series):
+        from xgboost import XGBRegressor
+        self.feature_names_ = list(X.columns)
+        for q in self.QUANTILES:
+            m = XGBRegressor(
+                objective="reg:quantileerror",
+                quantile_alpha=q,
+                **self.xgb_params,
+            )
+            m.fit(X, y, verbose=False)
+            self.models[q] = m
+        return self
+
+    def predict_quantiles(self, x_now: pd.DataFrame) -> Dict[float, float]:
+        return {q: float(m.predict(x_now[self.feature_names_])[0])
+                for q, m in self.models.items()}
+
+
+def forecast_xgboost_quantile(prices: pd.Series,
+                                X_train: pd.DataFrame, y_train: pd.Series,
+                                X_now: pd.DataFrame,
+                                horizon_days: int) -> HorizonForecast:
+    """XGBoost с reg:quantileerror — отдельная модель для каждого квантиля.
+    Даёт асимметричный коридор p10-p90. Точечный = средний квантиль.
+    """
+    p0 = float(prices.iloc[-1])
+    model = XGBQuantileModel().fit(X_train, y_train)
+    q = model.predict_quantiles(X_now)
+    # Точечный — между p25 и p75
+    mu_T = 0.5 * (q[0.25] + q[0.75])
+    sigma_d = daily_volatility(prices, 60)
+    floor_sigma = sigma_d * math.sqrt(horizon_days)
+    # σ из квантилей: p90 - p10 ≈ 2.56 σ для нормали
+    width = q[0.90] - q[0.10]
+    sigma_T = max(width / 2.56, floor_sigma, 1e-9)
+    point = p0 * math.exp(mu_T)
+    return HorizonForecast(
+        label=str(horizon_days), days=horizon_days, model="XGBQuantile",
+        p0=p0, point=point,
+        median=point,
+        p10=p0 * math.exp(q[0.10]),
+        p25=p0 * math.exp(q[0.25]),
+        p75=p0 * math.exp(q[0.75]),
+        p90=p0 * math.exp(q[0.90]),
+        mu_T=mu_T, sigma_T=sigma_T,
+    )
 
 
 def forecast_xgboost(prices: pd.Series,
