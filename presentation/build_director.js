@@ -3,19 +3,23 @@
 
 const pptxgen = require("pptxgenjs");
 
+// Палитра Акрон Холдинг: чёрный + красный
 const C = {
-  navy:        "1E2761",
-  ice:         "CADCFC",
-  copper:      "B87333",
-  copperDk:    "8B5A2B",
-  copperLight: "E8A87C",
-  charcoal:    "242938",
-  slate:       "5A6378",
+  // Основные цвета бренда
+  navy:        "1A1A1A",   // глубокий чёрный — вместо navy
+  copper:      "C8102E",   // фирменный красный — вместо copper
+  // Поддерживающие оттенки
+  copperDk:    "8B0E20",   // тёмно-красный (hover)
+  copperLight: "F08080",   // светло-красный (акценты)
+  ice:         "E0E0E0",   // светло-серый — вместо ice
+  charcoal:    "1A1A1A",   // основной текст
+  slate:       "5C5C5C",   // вспомогательный серый
   white:       "FFFFFF",
-  cream:       "F7F8FB",
-  green:       "0F9D58",
-  red:         "D93025",
-  amber:       "F4B400",
+  cream:       "F5F5F5",   // фон карточек
+  // Семантика (оставляем стандартную для понятности)
+  green:       "2E7D32",   // bullish — тёмно-зелёный (не диссонирует с red)
+  red:         "C8102E",   // bearish — фирменный (совпадает с copper)
+  amber:       "C97B00",   // warning — тёмно-янтарный
 };
 
 const FONT  = "Calibri";
@@ -79,21 +83,32 @@ const TOTAL = 17;
     fill: { color: C.copper }, line: { color: C.copper },
   });
 
+  // Логотип-плашка АКРОН (placeholder — может быть заменён на реальный лого)
+  s.addShape(pres.shapes.RECTANGLE, {
+    x: 0.6, y: 0.5, w: 2.6, h: 0.7,
+    fill: { color: C.copper }, line: { color: C.copper },
+  });
+  s.addText("АКРОН ХОЛДИНГ", {
+    x: 0.6, y: 0.5, w: 2.6, h: 0.7,
+    fontSize: 18, bold: true, color: C.white, fontFace: FONT,
+    align: "center", valign: "middle", margin: 0,
+  });
+
   s.addText("Cu", {
-    x: 0.6, y: 0.5, w: 1.5, h: 1.0,
-    fontSize: 78, bold: true, color: C.copper, fontFace: "Georgia", margin: 0,
+    x: 0.6, y: 1.4, w: 1.5, h: 0.9,
+    fontSize: 64, bold: true, color: C.copper, fontFace: "Georgia", margin: 0,
   });
   s.addText("медь · элемент №29", {
-    x: 0.6, y: 1.55, w: 4, h: 0.3,
+    x: 0.6, y: 2.25, w: 4, h: 0.3,
     fontSize: 12, italic: true, color: C.ice, fontFace: FONT, margin: 0,
   });
 
   s.addText("Прогноз цены меди", {
-    x: 0.6, y: 2.4, w: 9, h: 0.7,
+    x: 0.6, y: 2.8, w: 9, h: 0.7,
     fontSize: 40, bold: true, color: C.white, fontFace: FONT, margin: 0,
   });
   s.addText("как устроена модель и зачем нужен эксперт", {
-    x: 0.6, y: 3.15, w: 9, h: 0.45,
+    x: 0.6, y: 3.55, w: 9, h: 0.45,
     fontSize: 20, color: C.copperLight, italic: true, fontFace: FONT, margin: 0,
   });
 
