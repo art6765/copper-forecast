@@ -117,6 +117,7 @@ def fetch_ticker(ticker: str, start: str, use_cache: bool = True,
 
 def load_all(start: str = "2020-01-01", refresh: bool = False,
              include_cot: bool = True, include_lme_stocks: bool = True,
+             include_lme_price: bool = True,
              include_fred: bool = True) -> pd.DataFrame:
     """
     Возвращает единый DataFrame с дневной частотой и колонками:
@@ -163,15 +164,17 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
     out = out.reindex(bdays)
     out = out.ffill(limit=5).dropna(subset=["copper"])
 
-    # --- Дополнительные источники (CFTC COT, LME stocks, FRED) ---
-    if include_cot or include_lme_stocks or include_fred:
+    # --- Дополнительные источники (CFTC COT, LME stocks, LME price, FRED) ---
+    if include_cot or include_lme_stocks or include_lme_price or include_fred:
         try:
             from extra_sources import (fetch_cftc_cot, cot_to_daily,
                                         fetch_lme_stocks_westmetall,
+                                        fetch_lme_copper_price,
                                         fetch_fred_bundle)
         except ImportError as exc:
             logger.warning("extra_sources недоступен: %s", exc)
-            fetch_cftc_cot = fetch_lme_stocks_westmetall = fetch_fred_bundle = None
+            fetch_cftc_cot = fetch_lme_stocks_westmetall = None
+            fetch_lme_copper_price = fetch_fred_bundle = None
 
         if include_cot and fetch_cftc_cot is not None:
             try:
@@ -200,6 +203,29 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
                                 stk["lme_stock_total"].iloc[-1])
             except Exception as exc:
                 logger.warning("LME stocks не загружены: %s", exc)
+
+        # ---------- LME цена (cash + 3M) — гибрид с COMEX ----------
+        if include_lme_price and fetch_lme_copper_price is not None:
+            try:
+                lme = fetch_lme_copper_price(refresh=refresh)
+                if not lme.empty:
+                    lme_d = lme.reindex(out.index, method="ffill")
+                    for col in ["lme_cash", "lme_3m"]:
+                        if col in lme_d.columns:
+                            out[col] = lme_d[col]
+                    # Если ещё нет полной истории LME stocks — дополним из этого источника
+                    if "lme_stock_total" not in out.columns and "lme_stock" in lme_d.columns:
+                        out["lme_stock_total"] = lme_d["lme_stock"]
+                    # Премия COMEX над LME 3M (в %).
+                    # COMEX HG=F в USD/lb, LME в USD/t — приводим через LB_PER_TON.
+                    if "lme_3m" in out.columns:
+                        out["comex_lme_premium_pct"] = (
+                            (out["copper"] * LB_PER_TON) / out["lme_3m"] - 1
+                        ) * 100
+                    logger.info("LME prices: %d строк истории, последний 3M = %.0f USD/т",
+                                len(lme), lme["lme_3m"].iloc[-1])
+            except Exception as exc:
+                logger.warning("LME цена не загружена: %s", exc)
 
         if include_fred and fetch_fred_bundle is not None:
             try:

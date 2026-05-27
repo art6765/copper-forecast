@@ -78,6 +78,18 @@ def main():
     except Exception as exc:
         log.warning("⚠️  Westmetall LME stocks: %s", exc)
 
+    # 3b. Westmetall LME цены (cash + 3M, 100+ дней истории)
+    try:
+        from extra_sources import fetch_lme_copper_price
+        lme = fetch_lme_copper_price(refresh=True)
+        if not lme.empty:
+            log.info("✅ LME prices: %d дней истории, последний 3M = %.0f USD/т (%s)",
+                     len(lme),
+                     float(lme["lme_3m"].iloc[-1]),
+                     lme.index.max().date())
+    except Exception as exc:
+        log.warning("⚠️  Westmetall LME prices: %s", exc)
+
     # 4. FRED — опционально
     try:
         from extra_sources import fetch_fred_bundle

@@ -265,10 +265,20 @@ prev_lb = float(raw["copper"].iloc[-2])
 delta_pct = (p_lb / prev_lb - 1) * 100
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Цена меди (HG=F)", f"{p_lb:.4f} USD/lb", f"{delta_pct:+.2f}%")
-c2.metric("В тоннах", f"{p_t:,.0f} USD/t")
-c3.metric("Дата котировки", str(last_date))
-c4.metric("Глубина истории", f"{len(raw)} дн.")
+c1.metric("COMEX HG=F", f"{p_lb:.4f} USD/lb", f"{delta_pct:+.2f}%")
+c2.metric("COMEX в тоннах", f"{p_t:,.0f} USD/т")
+
+# LME 3M — глобальный baseline (если есть)
+if "lme_3m" in raw.columns and raw["lme_3m"].notna().any():
+    lme_3m_val = float(raw["lme_3m"].dropna().iloc[-1])
+    premium = (p_t / lme_3m_val - 1) * 100
+    c3.metric("LME Cu 3M (глобальный baseline)",
+               f"{lme_3m_val:,.0f} USD/т",
+               f"премия COMEX {premium:+.2f}%")
+else:
+    c3.metric("LME Cu 3M", "—", "источник недоступен")
+
+c4.metric("Дата котировки", str(last_date))
 
 # Подсветка текущего режима + COT/stocks badges
 c5, c6, c7 = st.columns([2, 1, 1])
@@ -546,6 +556,78 @@ with tab_macro:
         st.plotly_chart(fig1, use_container_width=True)
         st.caption("Вертикальные цветные линии — критические/высокие события "
                     "(severity ≥ high) из каталога. См. вкладку «📰 Новости и события».")
+
+    # ====== COMEX vs LME 3M (если есть данные) ======
+    if "lme_3m" in raw.columns and raw["lme_3m"].notna().sum() > 5:
+        st.markdown("---")
+        st.markdown("### 🔁 COMEX vs LME 3M — премия и спред")
+        st.caption(
+            "COMEX HG=F отражает американский рынок (с тарифной премией к LME). "
+            "LME 3M — глобальный baseline. Разница важна в эпоху тарифов 2025-2028."
+        )
+
+        comex_t = raw["copper"] * LB_PER_TON
+        lme = raw["lme_3m"].dropna()
+        # Совместный диапазон для визуальной чистоты
+        common = comex_t.index.intersection(lme.index)
+        if len(common) > 5:
+            fig_cl = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                    vertical_spacing=0.08,
+                                    subplot_titles=(
+                                        "Цены: COMEX (в USD/т) и LME 3M",
+                                        "Премия COMEX над LME, %"))
+            fig_cl.add_trace(
+                go.Scatter(x=common, y=comex_t.loc[common], name="COMEX HG=F",
+                            line=dict(color="#d62728", width=1.6)),
+                row=1, col=1,
+            )
+            fig_cl.add_trace(
+                go.Scatter(x=common, y=lme.loc[common], name="LME Cu 3M",
+                            line=dict(color="#1f77b4", width=1.6, dash="solid")),
+                row=1, col=1,
+            )
+            premium_series = (comex_t.loc[common] / lme.loc[common] - 1) * 100
+            fig_cl.add_trace(
+                go.Scatter(x=common, y=premium_series, name="Премия %",
+                            line=dict(color="#2ca02c", width=1.4),
+                            fill="tozeroy",
+                            fillcolor="rgba(44,160,44,0.15)"),
+                row=2, col=1,
+            )
+            fig_cl.add_hline(y=0, line=dict(color="gray", width=0.5),
+                              row=2, col=1)
+            fig_cl.update_layout(height=520, hovermode="x unified",
+                                  margin=dict(l=10, r=10, t=40, b=10),
+                                  legend=dict(orientation="h",
+                                                yanchor="bottom", y=1.02,
+                                                xanchor="right", x=1))
+            fig_cl.update_yaxes(title_text="USD/т", row=1, col=1)
+            fig_cl.update_yaxes(title_text="%", row=2, col=1)
+            st.plotly_chart(fig_cl, use_container_width=True)
+
+            # Текущая премия — статистики
+            cur_prem = (comex_t.loc[common].iloc[-1] / lme.loc[common].iloc[-1] - 1) * 100
+            avg_prem = premium_series.mean()
+            max_prem = premium_series.max()
+            min_prem = premium_series.min()
+            colA, colB, colC, colD = st.columns(4)
+            colA.metric("Премия сейчас", f"{cur_prem:+.2f}%")
+            colB.metric("Средняя за период", f"{avg_prem:+.2f}%")
+            colC.metric("Максимум", f"{max_prem:+.2f}%")
+            colD.metric("Минимум", f"{min_prem:+.2f}%")
+
+            with st.expander("ℹ️ Что значит премия COMEX/LME"):
+                st.markdown(
+                    "- **Норма (2000-2024):** 0–1 % — биржи отражают почти одну "
+                    "цену с учётом логистики.\n"
+                    "- **8 %** — short-squeeze на COMEX в мае 2024.\n"
+                    "- **До 30 %** — анонс тарифов Трампа в июле 2025.\n"
+                    "- **Сейчас выше 5 %** — есть смысл предпочесть LME 3M как "
+                    "baseline в решениях.\n"
+                    "- **Накопление истории:** парсер Westmetall работает ежедневно, "
+                    "так что эта картина будет всё длиннее с каждым запуском "
+                    "`update_data.py`."
+                )
 
     # Дополнительно — статистика последних значений
     st.markdown("**Сводные параметры волатильности (на основе доходностей)**")

@@ -154,6 +154,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     if "lme_stock_pct_change" in df.columns:
         out["lme_stock_pct_change"] = df["lme_stock_pct_change"]
 
+    # ---- Доп. фичи: LME (cash, 3M, премия COMEX/LME) ----
+    if "lme_3m" in df.columns:
+        out["lme_3m"] = df["lme_3m"]
+        out["lme_3m_log"] = np.log(df["lme_3m"].replace(0, np.nan))
+        # Скорость изменения LME 3M
+        out["lme_3m_ret_1d"] = np.log(df["lme_3m"] / df["lme_3m"].shift(1))
+        out["lme_3m_ret_5d"] = np.log(df["lme_3m"] / df["lme_3m"].shift(5))
+        out["lme_3m_ret_20d"] = np.log(df["lme_3m"] / df["lme_3m"].shift(20))
+    if "lme_cash" in df.columns and "lme_3m" in df.columns:
+        # Спред между cash и 3M (contango/backwardation)
+        out["lme_cash_3m_spread"] = (df["lme_cash"] - df["lme_3m"]) / df["lme_3m"] * 100
+    if "comex_lme_premium_pct" in df.columns:
+        # Главная новая фича — премия COMEX над LME
+        out["comex_lme_premium_pct"] = df["comex_lme_premium_pct"]
+        out["comex_lme_premium_chg_5d"] = df["comex_lme_premium_pct"].diff(5)
+        out["comex_lme_premium_chg_20d"] = df["comex_lme_premium_pct"].diff(20)
+
     # ---- Доп. фичи: FRED ----
     for col in ["fred_dxy_broad", "fred_dgs10", "fred_fedfunds",
                 "fred_cpi", "fred_indpro"]:

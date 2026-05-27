@@ -184,6 +184,94 @@ def cot_to_daily(cot: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
 # ============================================================
 
 WESTMETALL_OVERVIEW_URL = "https://www.westmetall.com/en/markdaten.php"
+WESTMETALL_LME_CASH_URL = "https://www.westmetall.com/en/markdaten.php?action=table&field=LME_Cu_cash"
+
+
+def fetch_lme_copper_price(refresh: bool = False) -> pd.DataFrame:
+    """
+    Парсинг таблицы LME_Cu_cash с Westmetall.
+    Бесплатно. Отдаёт около 100 дней истории за один запрос.
+    Кэш — data/cache_lme_price.csv — накапливается при каждом запуске.
+
+    Колонки:
+      lme_cash      — LME Copper Cash-Settlement, USD/т (spot)
+      lme_3m        — LME Copper 3-month, USD/т (главный baseline в аналитике)
+      lme_stock     — LME copper warehouse stocks, тонн
+    """
+    cache_path = DATA_DIR / "cache_lme_price.csv"
+    cached = None
+    if cache_path.exists():
+        try:
+            cached = pd.read_csv(cache_path, parse_dates=["date"]).set_index("date").sort_index()
+            if not refresh and cached.index.max() >= pd.Timestamp(dt.date.today()) - pd.Timedelta(days=2):
+                return cached
+        except Exception:
+            cached = None
+
+    try:
+        html = _get(WESTMETALL_LME_CASH_URL, timeout=20).decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("Westmetall LME_Cu_cash fetch failed: %s", exc)
+        if cached is not None:
+            return cached
+        return pd.DataFrame(columns=["lme_cash", "lme_3m", "lme_stock"])
+
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception as exc:
+        logger.warning("read_html LME_Cu_cash failed: %s", exc)
+        if cached is not None:
+            return cached
+        return pd.DataFrame(columns=["lme_cash", "lme_3m", "lme_stock"])
+
+    if not tables:
+        if cached is not None:
+            return cached
+        return pd.DataFrame(columns=["lme_cash", "lme_3m", "lme_stock"])
+
+    df = tables[0].copy()
+    # Стандартные колонки Westmetall:
+    # ['date', 'LME Copper Cash-Settlement', 'LME Copper 3-month', 'LME Copper stock']
+    rename = {
+        "date": "date",
+        "LME Copper Cash-Settlement": "lme_cash",
+        "LME Copper 3-month": "lme_3m",
+        "LME Copper stock": "lme_stock",
+    }
+    df = df.rename(columns=rename)
+    keep = [c for c in ["date", "lme_cash", "lme_3m", "lme_stock"] if c in df.columns]
+    df = df[keep]
+
+    # Парсим дату
+    for fmt in ("%d. %B %Y", "%d. %b %Y"):
+        try:
+            df["date"] = pd.to_datetime(df["date"], format=fmt)
+            break
+        except Exception:
+            continue
+    else:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+
+    # Числа: убираем запятые, пробелы
+    for c in ["lme_cash", "lme_3m", "lme_stock"]:
+        if c in df.columns:
+            df[c] = (df[c].astype(str)
+                          .str.replace(",", "")
+                          .str.replace(" ", "")
+                          .replace("nan", "")
+                          .pipe(pd.to_numeric, errors="coerce"))
+
+    # Мердж с кэшем (если был)
+    if cached is not None:
+        merged = pd.concat([cached, df])
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        df = merged
+
+    df.to_csv(cache_path, index_label="date")
+    logger.info("Westmetall LME prices: %d строк, %s → %s",
+                len(df), df.index.min().date(), df.index.max().date())
+    return df
 
 
 def _parse_westmetall_snapshot(html: str) -> Optional[Dict]:
