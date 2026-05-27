@@ -302,7 +302,7 @@ if "lme_stock_total" in raw.columns and raw["lme_stock_total"].notna().any():
                f"{int(raw['lme_stock_total'].dropna().iloc[-1]):,} т",
                f"{int(raw['lme_stock_change'].dropna().iloc[-1] if 'lme_stock_change' in raw.columns else 0):+,} т")
 
-# Плашка ТОП-3 предстоящих событий
+# Плашка ТОП-3 предстоящих событий с прогнозом и влиянием на медь
 try:
     top_events = get_top_events(n=3, days_ahead=30)
     if top_events:
@@ -313,16 +313,31 @@ try:
             days_str = (f"через {ev.days_until} дн." if ev.days_until > 0
                           else "сегодня" if ev.days_until == 0
                           else f"{-ev.days_until} дн. назад")
+            # Бейдж влияния на медь
+            impact_badge = ""
+            if ev.impact_copper:
+                impact_badge = (
+                    f"<span style='float:right; background:{ev.impact_color}; "
+                    f"color:white; padding:1px 6px; border-radius:3px; "
+                    f"font-size:11px; font-weight:bold'>"
+                    f"Cu {ev.impact_arrow} {ev.impact_copper}</span>"
+                )
+            consensus_line = ""
+            if ev.consensus:
+                consensus_line = (f"<br><small style='color:#666'>"
+                                  f"🎯 {ev.consensus}</small>")
             col.markdown(
                 f"<div style='background:#F7F8FB;border-left:4px solid {ev.color};"
                 f"padding:8px 12px;border-radius:4px;font-size:13px;'>"
-                f"<b style='color:{ev.color}'>{ev.importance.upper()}</b> · "
-                f"<span style='color:#555'>{ev.date} · {days_str}</span><br>"
+                f"<b style='color:{ev.color}'>{ev.importance.upper()}</b> "
+                f"{impact_badge}<br>"
+                f"<span style='color:#555;font-size:11px'>{ev.date} · {days_str}</span><br>"
                 f"<span style='color:#242938'>{label}</span>"
+                f"{consensus_line}"
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        st.caption("Полный календарь — во вкладке «📰 Новости и события» → «📅 Календарь».")
+        st.caption("Полный календарь с прогнозами — во вкладке «📰 Новости и события» → «📅 Календарь».")
 except Exception:
     pass
 
@@ -836,23 +851,43 @@ with tab_news:
         )
         st.markdown(f"**Найдено: {len(upcoming)} событий**")
 
-        # Группировка по неделям, чтобы не выводить простыню
         if upcoming:
-            df_upcoming = upcoming_to_dataframe(upcoming)
-            # Сделаем читаемую таблицу
-            display_df = df_upcoming[["Дата", "Дней", "Регион", "Тип",
-                                       "Важность", "Событие"]].copy()
-            display_df["Дней"] = display_df["Дней"].apply(
-                lambda d: f"через {d}" if d > 0 else "сегодня" if d == 0 else f"{-d} назад"
-            )
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            # Таблица с прогнозами
+            rows = []
+            for ev in upcoming:
+                days_label = (f"через {ev.days_until}"
+                              if ev.days_until > 0
+                              else "сегодня" if ev.days_until == 0
+                              else f"{-ev.days_until} назад")
+                impact_label = (f"{ev.impact_arrow} {ev.impact_copper}"
+                                if ev.impact_copper else "—")
+                rows.append({
+                    "Дата": ev.date,
+                    "Дней": days_label,
+                    "Регион": ev.region,
+                    "Тип": ev.icon + " " + ev.type,
+                    "Важность": ev.importance,
+                    "Событие": ev.title,
+                    "Предыдущее": ev.previous or "—",
+                    "Консенсус": ev.consensus or "—",
+                    "Влияние на Cu": impact_label,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                          hide_index=True)
 
-            # Карточки для high-importance
+            st.caption(
+                "**Прогнозы аналитиков** обновляются ежемесячно командой "
+                "разработки на основе публичных источников (CME FedWatch, "
+                "Reuters survey, корпоративные релизы). Для ежедневного "
+                "уточнения — кликайте на ссылку «🔗 Источник» в каждой карточке ниже."
+            )
+
+            # Карточки для high-importance с подробными прогнозами
             high_imp = [e for e in upcoming if e.importance == "high"]
             if high_imp:
                 st.markdown("---")
-                st.markdown("### 🚨 События с высокой важностью")
-                for ev in high_imp[:8]:
+                st.markdown("### 🚨 События с высокой важностью — подробно")
+                for ev in high_imp[:10]:
                     with st.container(border=True):
                         col_e1, col_e2 = st.columns([1, 5])
                         with col_e1:
@@ -869,12 +904,44 @@ with tab_news:
                                 f"<small>{days_label}</small>",
                                 unsafe_allow_html=True,
                             )
+                            # Бейдж влияния на медь
+                            if ev.impact_copper:
+                                st.markdown(
+                                    f"<div style='margin-top:8px; padding:4px 8px; "
+                                    f"background:{ev.impact_color}; color:white; "
+                                    f"border-radius:4px; font-size:11px; text-align:center'>"
+                                    f"Cu {ev.impact_arrow} <b>{ev.impact_copper}</b></div>",
+                                    unsafe_allow_html=True,
+                                )
                         with col_e2:
                             st.markdown(f"**{ev.title}**")
                             st.caption(f"`{ev.type}`")
                             st.write(ev.description)
+
+                            # Блок с прогнозами аналитиков
+                            if ev.previous or ev.consensus or ev.impact_note:
+                                cols_fc = st.columns(2)
+                                with cols_fc[0]:
+                                    if ev.previous:
+                                        st.markdown(
+                                            f"📊 **Предыдущее значение**  \n{ev.previous}"
+                                        )
+                                with cols_fc[1]:
+                                    if ev.consensus:
+                                        st.markdown(
+                                            f"🎯 **Консенсус аналитиков**  \n{ev.consensus}"
+                                        )
+                                if ev.impact_note:
+                                    st.info(f"💡 {ev.impact_note}")
+
+                            # Ссылки
+                            links = []
                             if ev.source:
-                                st.markdown(f"[🔗 Источник]({ev.source})")
+                                links.append(f"[📋 Источник]({ev.source})")
+                            if ev.forecast_source:
+                                links.append(f"[🔮 Свежие прогнозы]({ev.forecast_source})")
+                            if links:
+                                st.markdown(" · ".join(links))
 
     # ---- Свежие новости ----
     with sub_news:
