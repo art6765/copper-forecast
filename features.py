@@ -33,6 +33,151 @@ CROSS_ASSETS = [
 ]
 
 
+# ====================================================================
+#  Человекочитаемые названия активов (для расшифровки признаков)
+# ====================================================================
+ASSET_LABELS = {
+    "dxy":    "доллар (DXY)",
+    "wti":    "нефть WTI",
+    "gold":   "золото",
+    "silver": "серебро",
+    "sp500":  "S&P 500",
+    "us10y":  "доходность US 10Y",
+    "audusd": "австралийский доллар (AUD/USD)",
+    "usdclp": "чилийский песо (USD/CLP)",
+    "usdcny": "китайский юань (USD/CNY)",
+    "copx":   "ETF медных майнеров (COPX)",
+    "pick":   "ETF металлов и добычи (PICK)",
+    "slx":    "ETF сталелитейщиков (SLX)",
+    "vix":    "индекс страха (VIX)",
+    "bdry":   "ставки фрахта (Baltic Dry)",
+}
+
+
+def describe_feature(name: str) -> str:
+    """Человекочитаемое описание признака по его имени.
+    Покрывает все паттерны из build_features(). Возвращает строку на русском.
+    """
+    import re
+
+    # Точные совпадения
+    exact = {
+        "log_price": "Логарифм цены меди",
+        "ret_1d": "Дневная доходность меди (лог)",
+        "rsi_14": "RSI(14) — индекс силы тренда (0-100): >70 перекуплен, <30 перепродан",
+        "macd": "MACD — разница быстрой и медленной скользящих средних",
+        "macd_signal": "Сигнальная линия MACD (EMA-9 от MACD)",
+        "macd_hist": "MACD-гистограмма (MACD − сигнал); пересечение нуля = разворот",
+        "bbpctb_20": "Bollinger %B(20): где цена внутри полос ±2σ (0=низ, 1=верх)",
+        "atr_14": "ATR(14) — средний истинный диапазон, абсолютная волатильность",
+        "atr_rel": "ATR(14), нормированный на цену (волатильность в %)",
+        "sma_5_20": "Соотношение SMA-5 / SMA-20: >0 краткосрочный тренд вверх",
+        "sma_20_60": "Соотношение SMA-20 / SMA-60: >0 среднесрочный тренд вверх",
+        "dow": "День недели (0=Пн … 4=Пт) — сезонность внутри недели",
+        "dom": "День месяца (1-31)",
+        "month": "Месяц (1-12) — годовая сезонность",
+        "lme_3m": "Цена LME 3-month, USD/т (глобальный baseline)",
+        "lme_3m_log": "Логарифм цены LME 3M",
+        "lme_cash_3m_spread": "Спред LME cash − 3M, %: >0 бэквардация, <0 контанго",
+        "comex_lme_premium_pct": "Премия COMEX над LME 3M, % — индикатор тарифного режима США",
+        "cot_mm_net_long": "CFTC: чистая длинная позиция хедж-фондов, контрактов",
+        "cot_mm_net_long_z": "COT net long как z-score за 5 лет: >2 экстремальный перегрев",
+        "cot_mm_net_long_pct": "COT net long как % от открытого интереса",
+        "cot_open_interest": "Открытый интерес COMEX — общее число контрактов",
+        "cot_pm_net_long": "CFTC: чистая позиция производителей/торговцев (хеджеры)",
+        "lme_stock_total": "Складские запасы меди на LME, тонн",
+        "lme_stock_log": "Логарифм складских запасов LME",
+        "lme_stock_pct_change": "Дневное изменение запасов LME, %",
+    }
+    if name in exact:
+        return exact[name]
+
+    # Паттерны
+    m = re.match(r"ret_lag_(\d+)$", name)
+    if m:
+        return f"Доходность меди {m.group(1)} дн. назад"
+
+    m = re.match(r"log_price_lag_(\d+)$", name)
+    if m:
+        return f"Логарифм цены меди {m.group(1)} дн. назад"
+
+    m = re.match(r"sma_(\d+)$", name)
+    if m:
+        w = m.group(1)
+        return f"Скользящее среднее цены за {w} дней = (P_t + P_t-1 + … + P_t-{int(w)-1}) / {w}"
+
+    m = re.match(r"price_to_sma_(\d+)$", name)
+    if m:
+        return f"Отклонение цены от SMA-{m.group(1)}: P / SMA − 1 (насколько выше/ниже среднего)"
+
+    m = re.match(r"vol_(\d+)$", name)
+    if m:
+        return f"Годовая волатильность за {m.group(1)} дней (стд доходностей × √252)"
+
+    m = re.match(r"mom_(\d+)$", name)
+    if m:
+        return f"Моментум за {m.group(1)} дней: накопленная доходность ln(P_t / P_t-{m.group(1)})"
+
+    # Кросс-активные
+    m = re.match(r"(\w+?)_ret_(\d+)d$", name)
+    if m and m.group(1) in ASSET_LABELS:
+        return f"Изменение {ASSET_LABELS[m.group(1)]} за {m.group(2)} дн. (лог)"
+
+    m = re.match(r"(\w+?)_vol_20$", name)
+    if m and m.group(1) in ASSET_LABELS:
+        return f"Волатильность {ASSET_LABELS[m.group(1)]} за 20 дней"
+
+    m = re.match(r"corr_cu_(\w+?)_60$", name)
+    if m and m.group(1) in ASSET_LABELS:
+        return f"Скользящая 60-дн. корреляция меди с {ASSET_LABELS[m.group(1)]}"
+
+    # COT-изменения
+    m = re.match(r"cot_mm_net_long_chg_(\d+)w$", name)
+    if m:
+        return f"Изменение COT net long за {m.group(1)} недель"
+    if name == "cot_oi_chg_4w":
+        return "Изменение открытого интереса за 4 недели, %"
+
+    # LME stocks изменения
+    m = re.match(r"lme_stock_chg_(\d+)d$", name)
+    if m:
+        return f"Изменение запасов LME за {m.group(1)} дней, %"
+
+    # LME 3M доходности
+    m = re.match(r"lme_3m_ret_(\d+)d$", name)
+    if m:
+        return f"Изменение цены LME 3M за {m.group(1)} дн. (лог)"
+
+    # Премия изменения
+    m = re.match(r"comex_lme_premium_chg_(\d+)d$", name)
+    if m:
+        return f"Изменение премии COMEX/LME за {m.group(1)} дней"
+
+    # FRED
+    fred = {
+        "fred_dxy_broad": "FRED: широкий индекс доллара (DTWEXBGS)",
+        "fred_dgs10": "FRED: доходность US 10Y Treasury",
+        "fred_fedfunds": "FRED: эффективная ставка ФРС",
+        "fred_cpi": "FRED: индекс потребительских цен США (CPI)",
+        "fred_indpro": "FRED: индекс промышленного производства США",
+    }
+    if name in fred:
+        return fred[name]
+    m = re.match(r"(fred_\w+)_chg_20d$", name)
+    if m and m.group(1) in fred:
+        return f"{fred[m.group(1)]} — изменение за 20 дней"
+    m = re.match(r"(fred_\w+)_yoy$", name)
+    if m and m.group(1) in fred:
+        return f"{fred[m.group(1)]} — изменение год к году, %"
+
+    # Сезонные (если добавятся)
+    m = re.match(r"seasonal_h(\d+)$", name)
+    if m:
+        return f"Сезонный сигнал: средняя историческая доходность на {m.group(1)} дн. вперёд"
+
+    return name  # fallback — само имя
+
+
 def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)

@@ -25,6 +25,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data_loader import load_all, LB_PER_TON
+from features import describe_feature
 from models import (
     forecast_all_horizons, forecasts_to_dataframe, HORIZONS,
     ensemble_forecast, forecast_at_point, actuals_after_point,
@@ -804,6 +805,10 @@ with tab_fc:
             cdf = exp["df"]
             meta = exp["meta"]
 
+            # Человекочитаемые описания признаков
+            cdf = cdf.copy()
+            cdf["Что это"] = cdf["feature"].apply(describe_feature)
+
             col_s1, col_s2 = st.columns([2, 1])
             with col_s1:
                 # Горизонтальный bar-chart вкладов
@@ -814,12 +819,13 @@ with tab_fc:
                     x=cdf["contribution"][::-1],
                     orientation="h",
                     marker=dict(color=colors[::-1]),
+                    customdata=cdf[["value", "Что это"]][::-1].values,
                     hovertemplate=(
                         "<b>%{y}</b><br>"
-                        "Значение: %{customdata:.4f}<br>"
+                        "%{customdata[1]}<br>"
+                        "Значение: %{customdata[0]:.4f}<br>"
                         "Вклад: %{x:.5f}<extra></extra>"
                     ),
-                    customdata=cdf["value"][::-1].values,
                 ))
                 fig_shap.add_vline(x=0, line=dict(color="gray", width=1))
                 fig_shap.update_layout(
@@ -837,13 +843,27 @@ with tab_fc:
                 st.caption(f"Всего признаков в модели: {meta['total_features']}")
                 st.caption("Показано топ-10 по абсолютному вкладу.")
 
-            with st.expander("💡 Как читать"):
+            # Таблица-расшифровка топ-10 признаков
+            st.markdown("**📖 Расшифровка показанных признаков:**")
+            decode_df = pd.DataFrame({
+                "Признак": cdf["feature"],
+                "Что это": cdf["Что это"],
+                "Тек. значение": cdf["value"].round(4),
+                "Вклад": cdf["contribution"].round(5),
+                "Направление": ["↑ вверх" if c > 0 else "↓ вниз"
+                                for c in cdf["contribution"]],
+            })
+            st.dataframe(decode_df, use_container_width=True, hide_index=True)
+
+            with st.expander("💡 Как читать + где полный справочник признаков"):
                 st.markdown(
                     "- **Зелёные** бары — фичи тянут прогноз **вверх** (рост цены).\n"
                     "- **Красные** — тянут **вниз** (снижение цены).\n"
-                    "- Длина = сила влияния (в лог-пространстве).\n"
-                    "- Hover показывает текущее значение фичи (например, `dxy_ret_5d = -0.012`).\n"
-                    "- Сумма всех вкладов + baseline = итоговый прогноз модели."
+                    "- Длина = сила влияния (в лог-пространстве доходности).\n"
+                    "- Наведите мышь на бар — увидите описание признака и его значение.\n"
+                    "- Сумма всех вкладов + baseline = итоговый прогноз модели.\n\n"
+                    "**Полный справочник всех ~95 признаков** с формулами — в файле "
+                    "`FEATURES.md` (или `FEATURES.docx`) в репозитории проекта."
                 )
 
     # Раскрытие — детальная таблица по всем моделям
