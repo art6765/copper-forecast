@@ -25,6 +25,61 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER
 
 LB_PER_TON = 2204.62262
 
+
+# ====================================================================
+#  Регистрация шрифта с кириллицей (DejaVu Sans из matplotlib)
+#  Стандартный Helvetica в reportlab НЕ содержит кириллицу → квадраты.
+# ====================================================================
+
+def _register_cyrillic_fonts():
+    """Регистрирует DejaVu Sans (regular + bold). Возвращает (normal, bold)
+    имена шрифтов. При неудаче — fallback на Helvetica (латиница).
+    """
+    import os
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.pdfmetrics import registerFontFamily
+
+    # Если уже зарегистрирован — не повторяем
+    if "DejaVu" in pdfmetrics.getRegisteredFontNames():
+        return "DejaVu", "DejaVu-Bold"
+
+    candidates_dirs = []
+    try:
+        import matplotlib
+        candidates_dirs.append(
+            os.path.join(matplotlib.get_data_path(), "fonts", "ttf"))
+    except Exception:
+        pass
+    # Системные пути (Linux / macOS)
+    candidates_dirs += [
+        "/usr/share/fonts/truetype/dejavu",
+        "/Library/Fonts", "/System/Library/Fonts/Supplemental",
+    ]
+
+    regular = bold = None
+    for d in candidates_dirs:
+        r = os.path.join(d, "DejaVuSans.ttf")
+        b = os.path.join(d, "DejaVuSans-Bold.ttf")
+        if regular is None and os.path.exists(r):
+            regular = r
+        if bold is None and os.path.exists(b):
+            bold = b
+    if regular is None:
+        return "Helvetica", "Helvetica-Bold"  # fallback
+
+    try:
+        pdfmetrics.registerFont(TTFont("DejaVu", regular))
+        if bold and os.path.exists(bold):
+            pdfmetrics.registerFont(TTFont("DejaVu-Bold", bold))
+        else:
+            pdfmetrics.registerFont(TTFont("DejaVu-Bold", regular))
+        registerFontFamily("DejaVu", normal="DejaVu", bold="DejaVu-Bold",
+                            italic="DejaVu", boldItalic="DejaVu-Bold")
+        return "DejaVu", "DejaVu-Bold"
+    except Exception:
+        return "Helvetica", "Helvetica-Bold"
+
 COL_NAVY = colors.HexColor("#1E2761")
 COL_COPPER = colors.HexColor("#B87333")
 COL_GREEN = colors.HexColor("#0F9D58")
@@ -33,23 +88,29 @@ COL_GRAY = colors.HexColor("#666666")
 COL_LIGHT = colors.HexColor("#F7F8FB")
 
 
-def _styles():
+def _styles(font_normal: str, font_bold: str):
     base = getSampleStyleSheet()
     return {
         "title": ParagraphStyle("title", parent=base["Title"],
+                                  fontName=font_bold,
                                   fontSize=20, textColor=COL_NAVY,
                                   spaceAfter=6, alignment=TA_LEFT),
         "h2": ParagraphStyle("h2", parent=base["Heading2"],
+                              fontName=font_bold,
                               fontSize=13, textColor=COL_COPPER,
                               spaceAfter=4, spaceBefore=8),
         "body": ParagraphStyle("body", parent=base["BodyText"],
+                                fontName=font_normal,
                                 fontSize=10, leading=13),
         "small": ParagraphStyle("small", parent=base["BodyText"],
+                                  fontName=font_normal,
                                   fontSize=8, leading=10, textColor=COL_GRAY),
         "metric_label": ParagraphStyle("ml", parent=base["BodyText"],
+                                         fontName=font_normal,
                                          fontSize=9, textColor=COL_GRAY,
                                          alignment=TA_CENTER),
         "metric_value": ParagraphStyle("mv", parent=base["BodyText"],
+                                         fontName=font_normal,
                                          fontSize=14, textColor=COL_NAVY,
                                          alignment=TA_CENTER, leading=18),
     }
@@ -86,7 +147,8 @@ def generate_pdf_report(
         title="Прогноз цены меди — отчёт",
     )
 
-    S = _styles()
+    font_normal, font_bold = _register_cyrillic_fonts()
+    S = _styles(font_normal, font_bold)
     elements = []
 
     # --- Шапка ---
@@ -135,7 +197,7 @@ def generate_pdf_report(
     elements.append(Spacer(1, 12))
 
     # --- Прогнозы ансамбля ---
-    elements.append(Paragraph("🎯 Прогноз цены меди по горизонтам (ансамбль)",
+    elements.append(Paragraph("Прогноз цены меди по горизонтам (ансамбль)",
                                 S["h2"]))
     if not forecasts_df.empty:
         ens = forecasts_df[forecasts_df["Модель"] == "Ensemble"].copy()
@@ -155,7 +217,8 @@ def generate_pdf_report(
             tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), COL_NAVY),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 0), (-1, 0), font_bold),
+                ("FONTNAME", (0, 1), (-1, -1), font_normal),
                 ("ALIGN", (1, 0), (-1, -1), "CENTER"),
                 ("ALIGN", (0, 0), (0, -1), "LEFT"),
                 ("FONTSIZE", (0, 0), (-1, -1), 9),
@@ -176,25 +239,31 @@ def generate_pdf_report(
 
     # --- Топ-3 предстоящих события ---
     if top_events:
-        elements.append(Paragraph("📅 Ближайшие ключевые события", S["h2"]))
-        ev_rows = [["Дата", "Дней", "Событие", "Консенсус", "Влияние на Cu"]]
+        elements.append(Paragraph("Ближайшие ключевые события", S["h2"]))
+        # Стиль для ячеек — мелкий шрифт с переносом строк
+        cell = ParagraphStyle("cell", fontName=font_normal, fontSize=8,
+                                leading=10)
+        ev_rows = [["Дата", "Дней", "Событие", "Консенсус", "Влияние"]]
         for ev in top_events[:5]:
             days_str = (f"+{ev.days_until}" if ev.days_until > 0
                         else "сегодня" if ev.days_until == 0
                         else f"{ev.days_until}")
             impact = ev.impact_copper or "—"
+            # Длинные текстовые ячейки оборачиваем в Paragraph — иначе текст
+            # вылезает за границу и наезжает на соседнюю колонку.
             ev_rows.append([
                 str(ev.date), days_str,
-                f"{ev.region} {ev.title}",
-                (ev.consensus or "—")[:50],
-                f"{ev.impact_arrow} {impact}",
+                Paragraph(ev.title, cell),
+                Paragraph(ev.consensus or "—", cell),
+                Paragraph(f"{ev.impact_arrow} {impact}", cell),
             ])
         ev_tbl = Table(ev_rows,
                         colWidths=[22*mm, 18*mm, 60*mm, 50*mm, 30*mm])
         ev_tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), COL_COPPER),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), font_bold),
+            ("FONTNAME", (0, 1), (-1, -1), font_normal),
             ("FONTSIZE", (0, 0), (-1, -1), 8),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("BOX", (0, 0), (-1, -1), 0.5, COL_GRAY),
@@ -207,7 +276,7 @@ def generate_pdf_report(
     # --- Footer / дисклеймер ---
     elements.append(Spacer(1, 16))
     elements.append(Paragraph(
-        "⚠️ <b>Дисклеймер:</b> Исследовательский прототип, не торговая рекомендация. "
+        "<b>Дисклеймер:</b> Исследовательский прототип, не торговая рекомендация. "
         "Прогноз построен на ценовых рядах и кросс-активных данных без учёта "
         "политических рисков, забастовок и фундаментальных балансов. На горизонтах >3 мес "
         "большую роль играют шоки предложения, которые модель не предсказывает.",
