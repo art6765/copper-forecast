@@ -544,8 +544,9 @@ with tab_fc:
 
     # Опции overlay
     col_o1, col_o2 = st.columns([1, 1])
-    show_events = col_o1.checkbox("📌 Показать важные события на графике",
-                                   value=True)
+    show_events = col_o1.checkbox(
+        "📌 События на графике (сплошные — прошлые, пунктир — предстоящие)",
+        value=True)
     event_severity = col_o2.selectbox(
         "Минимальный уровень severity",
         ["low", "medium", "high", "critical"], index=1,
@@ -636,6 +637,8 @@ with tab_fc:
         # Диапазон графика
         left_d = hist.index.min().date()
         right_d = (last_d + pd.Timedelta(days=200)).date()
+
+        # 1) Исторические события (сплошные линии)
         evs = events_in_range(left_d, right_d, min_severity=event_severity)
         for ev in evs:
             _safe_vline(
@@ -644,6 +647,30 @@ with tab_fc:
                 annotation_text=f"{ev.icon} {ev.severity[:1].upper()}",
                 hovertext=f"<b>{ev.date}</b> {ev.title} · {ev.severity}",
             )
+
+        # 2) ПРЕДСТОЯЩИЕ события (пунктирные линии) — попадают в зону прогноза.
+        #    Берём окно до правого края графика (≈200 кален. дней вперёд).
+        try:
+            days_ahead = max(10, (right_d - dt.date.today()).days)
+            # severity → importance: для предстоящих фильтруем medium+ если
+            # выбран high у исторических, иначе показываем по тому же порогу
+            imp_map = {"low": "low", "medium": "medium",
+                       "high": "high", "critical": "high"}
+            min_imp = imp_map.get(event_severity, "medium")
+            upcoming = get_upcoming_events(days_ahead=days_ahead,
+                                           min_importance=min_imp)
+            for ev in upcoming:
+                arrow = ev.impact_arrow or ""
+                _safe_vline(
+                    fig, x=pd.Timestamp(ev.date),
+                    color=ev.color, dash="dot", width=1.4, opacity=0.7,
+                    annotation_text=f"{ev.icon}{arrow}",
+                    hovertext=(f"<b>{ev.date}</b> (предстоящее)<br>{ev.title}<br>"
+                               f"Консенсус: {ev.consensus or '—'}<br>"
+                               f"Влияние на Cu: {ev.impact_copper or '—'}"),
+                )
+        except Exception:
+            pass
 
     fig.update_layout(
         height=560, hovermode="x unified",
