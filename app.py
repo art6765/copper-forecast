@@ -542,15 +542,29 @@ with tab_fc:
     left_window = max(0, idx_base - hist_days)
     hist = hist_full.iloc[left_window : idx_base + 1]
 
-    # Опции overlay
-    col_o1, col_o2 = st.columns([1, 1])
-    show_events = col_o1.checkbox(
-        "📌 События на графике (сплошные — прошлые, пунктир — предстоящие)",
-        value=True)
-    event_severity = col_o2.selectbox(
-        "Минимальный уровень severity",
-        ["low", "medium", "high", "critical"], index=1,
+    # Опции overlay событий
+    st.markdown("**📌 События на графике**")
+    col_o1, col_o2, col_o3 = st.columns([1, 1, 1.4])
+    show_hist = col_o1.checkbox("Прошлые (сплошные)", value=True,
+                                 help="Исторические события из каталога: "
+                                      "Cobre Panamá, Escondida, тарифы и т.д.")
+    show_upcoming = col_o2.checkbox("Предстоящие (пунктир)", value=True,
+                                     help="Будущие события из календаря: "
+                                          "FOMC, CPI, PMI, ICSG.")
+    detail_level = col_o3.radio(
+        "Детализация",
+        ["Только ключевые", "Все события"],
+        horizontal=True, index=0,
+        help="«Только ключевые» = high/critical. «Все» = включая low/medium "
+             "(CFTC COT каждую пятницу, ECB и т.п.).",
     )
+    # Маппинг детализации в пороги фильтрации
+    if detail_level == "Только ключевые":
+        hist_min_severity = "high"     # high + critical
+        upcoming_min_importance = "high"
+    else:
+        hist_min_severity = "low"      # все
+        upcoming_min_importance = "low"
 
     fig = go.Figure()
 
@@ -632,14 +646,13 @@ with tab_fc:
     _safe_vline(fig, x=last_d, color="gray", dash="dot", width=1,
                 annotation_text=f"as of {last_d.date()}")
 
-    # Overlay событий
-    if show_events:
-        # Диапазон графика
-        left_d = hist.index.min().date()
-        right_d = (last_d + pd.Timedelta(days=200)).date()
+    # Overlay событий — границы графика
+    left_d = hist.index.min().date()
+    right_d = (last_d + pd.Timedelta(days=200)).date()
 
-        # 1) Исторические события (сплошные линии)
-        evs = events_in_range(left_d, right_d, min_severity=event_severity)
+    # 1) Исторические события (сплошные линии)
+    if show_hist:
+        evs = events_in_range(left_d, right_d, min_severity=hist_min_severity)
         for ev in evs:
             _safe_vline(
                 fig, x=pd.Timestamp(ev.date),
@@ -648,17 +661,12 @@ with tab_fc:
                 hovertext=f"<b>{ev.date}</b> {ev.title} · {ev.severity}",
             )
 
-        # 2) ПРЕДСТОЯЩИЕ события (пунктирные линии) — попадают в зону прогноза.
-        #    Берём окно до правого края графика (≈200 кален. дней вперёд).
+    # 2) Предстоящие события (пунктирные линии) — попадают в зону прогноза
+    if show_upcoming:
         try:
             days_ahead = max(10, (right_d - dt.date.today()).days)
-            # severity → importance: для предстоящих фильтруем medium+ если
-            # выбран high у исторических, иначе показываем по тому же порогу
-            imp_map = {"low": "low", "medium": "medium",
-                       "high": "high", "critical": "high"}
-            min_imp = imp_map.get(event_severity, "medium")
             upcoming = get_upcoming_events(days_ahead=days_ahead,
-                                           min_importance=min_imp)
+                                           min_importance=upcoming_min_importance)
             for ev in upcoming:
                 arrow = ev.impact_arrow or ""
                 _safe_vline(
