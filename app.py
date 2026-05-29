@@ -41,6 +41,9 @@ from upcoming_events import (
     get_upcoming_events, get_top_events,
     events_to_dataframe as upcoming_to_dataframe,
 )
+from buyer_logic import (
+    compute_verdict, all_verdicts, buyer_factors, VERDICT_META,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -184,8 +187,73 @@ def cached_backtest(years: int, train_min_days: int, step_days: int,
 #  Side panel
 # ============================================================
 
-st.set_page_config(page_title="Copper Forecast MVP",
+st.set_page_config(page_title="CopperCast — прогноз цены меди",
                    page_icon="🟫", layout="wide")
+
+# ============================================================
+#  Корпоративный стиль Акрон Холдинг (CSS-инъекция)
+# ============================================================
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Golos Text', sans-serif; }
+
+/* Карточка вердикта закупщика */
+.verdict-card {
+    border-radius: 16px; padding: 28px 32px; margin: 8px 0 18px;
+    background: #FFFFFF; border: 1px solid #D5DBE0;
+    box-shadow: 0 4px 12px rgba(0,24,41,.08);
+    position: relative; overflow: hidden;
+}
+.verdict-card .rail {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 8px;
+}
+.verdict-eyebrow {
+    font-size: 12px; font-weight: 700; letter-spacing: .08em;
+    text-transform: uppercase; color: #7F8B93; margin-bottom: 6px;
+}
+.verdict-price {
+    font-family: 'JetBrains Mono', monospace; font-size: 52px;
+    font-weight: 800; line-height: 1.0; color: #001829;
+}
+.verdict-price .u { font-size: 22px; color: #7F8B93; font-weight: 600; }
+.verdict-rub { font-size: 15px; color: #7F8B93; margin-top: 4px;
+               font-family: 'JetBrains Mono', monospace; }
+.verdict-tag {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 22px; font-weight: 800; margin: 16px 0 8px;
+    padding: 8px 18px; border-radius: 999px;
+}
+.verdict-sub { font-size: 16px; color: #001829; line-height: 1.5; }
+
+/* Светофор уверенности */
+.conf-light { display: inline-flex; gap: 5px; align-items: center; }
+.conf-dot { width: 11px; height: 11px; border-radius: 50%;
+            background: #D5DBE0; }
+
+/* Селектор горизонта — мини-карточки */
+.hz-mini {
+    border-radius: 12px; padding: 12px 14px; text-align: center;
+    border: 2px solid #D5DBE0; background: #FFFFFF;
+}
+.hz-mini .d { font-size: 15px; font-weight: 800; color: #001829; }
+.hz-mini .l { font-size: 11px; color: #7F8B93; margin-bottom: 6px; }
+
+/* Чип фактора */
+.factor-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: 999px; background: #F2F5F7;
+    font-size: 13px; margin: 3px 4px 3px 0; color: #001829;
+}
+.factor-chip .b { width: 9px; height: 9px; border-radius: 50%; }
+
+/* Заголовок-бренд */
+.brand-head { display:flex; align-items:baseline; gap: 12px; }
+.brand-head .logo { font-size: 30px; font-weight: 900; color: #E00613; }
+.brand-head .sub { font-size: 13px; color: #7F8B93; }
+</style>
+""", unsafe_allow_html=True)
 
 st.sidebar.title("⚙️ Параметры")
 years = st.sidebar.slider("Глубина истории, лет", 3, 10, 5, step=1)
@@ -317,8 +385,195 @@ def _custom_ensemble(results_local: Dict) -> Dict[str, dict]:
 
 custom_ens = _custom_ensemble(results)
 
+
 # ============================================================
-#  Header
+#  Переключатель режима: Закупщик ↔ Эксперт
+# ============================================================
+
+def _regime_calm_prob() -> Optional[float]:
+    try:
+        sig_r = f"{raw.index.max().date()}_{years}_2"
+        fit_q, _ = cached_regimes(sig_r, k_regimes=2)
+        sorted_by_sigma = fit_q.params.sort_values("sigma")
+        calm_idx = sorted_by_sigma.index[0]
+        return fit_q.current_probs.get(calm_idx, 0.5)
+    except Exception:
+        return None
+
+
+hdr_l, hdr_r = st.columns([3, 2])
+with hdr_l:
+    st.markdown(
+        "<div class='brand-head'><span class='logo'>CopperCast</span>"
+        "<span class='sub'>медь · прогноз цены · COMEX HG=F</span></div>",
+        unsafe_allow_html=True,
+    )
+with hdr_r:
+    app_mode = st.radio(
+        "Режим", ["🛒 Закупщик", "📊 Эксперт"],
+        horizontal=True, label_visibility="collapsed",
+        help="Закупщик — простой совет «покупать или ждать». "
+             "Эксперт — все модели, метрики, графики.",
+    )
+
+
+# ============================================================
+#  BUYER MODE — режим закупщика
+# ============================================================
+
+def _conf_light(conf: int, color: str) -> str:
+    """HTML-светофор уверенности: 5 точек, закрашено пропорционально conf."""
+    filled = round(conf / 20)
+    dots = "".join(
+        f"<span class='conf-dot' style='background:{color if i < filled else '#D5DBE0'}'></span>"
+        for i in range(5)
+    )
+    return f"<span class='conf-light'>{dots}</span>"
+
+
+def render_buyer():
+    spot_lb = float(raw["copper"].iloc[-1])
+    spot_t = spot_lb * LB_PER_TON
+    calm = _regime_calm_prob()
+
+    st.markdown(f"## Покупать или подождать?")
+    st.caption(f"Медь · COMEX HG=F · спот **{spot_t:,.0f} USD/т** · данные на {raw.index.max().date()}")
+
+    # --- Селектор горизонта ---
+    # compute_verdict ждёт {hk: {model_name: HorizonForecast}}.
+    # custom_ens[hk] — это один HorizonForecast (наш ансамбль с весами),
+    # поэтому оборачиваем его под именем "Ensemble".
+    verdict_input = {}
+    for hk, models in results.items():
+        if hk in custom_ens:
+            verdict_input[hk] = {"Ensemble": custom_ens[hk]}
+        else:
+            verdict_input[hk] = models
+    verdicts = all_verdicts(verdict_input, spot_lb, calm)
+    if not verdicts:
+        st.error("Не удалось построить вердикты — проверьте, что включён хотя бы "
+                 "ансамбль из 2 моделей.")
+        return
+
+    hz_order = ["h_3d", "h_10d", "h_1m", "h_3m", "h_6m"]
+    hz_avail = [h for h in hz_order if h in verdicts]
+    hz_labels = {h: verdicts[h].horizon_label for h in hz_avail}
+
+    chosen = st.radio(
+        "Горизонт планирования",
+        hz_avail, format_func=lambda h: hz_labels[h],
+        horizontal=True, index=hz_avail.index("h_1m") if "h_1m" in hz_avail else 0,
+    )
+    v = verdicts[chosen]
+
+    # --- Карточка вердикта ---
+    tone_bg = {"ok": "rgba(25,135,84,.12)", "warn": "rgba(245,158,11,.14)",
+               "wait": "rgba(224,6,19,.10)"}[v.tone]
+    sub_label = {"h_3d": "ближайшая поставка", "h_10d": "спот-закупка",
+                 "h_1m": "месячный контракт", "h_3m": "квартальный контракт",
+                 "h_6m": "полугодовой контракт"}.get(chosen, "")
+
+    st.markdown(f"""
+<div class='verdict-card'>
+  <div class='rail' style='background:{v.color}'></div>
+  <div style='padding-left:14px'>
+    <div class='verdict-eyebrow'>Цель на {v.horizon_label.lower()} · {sub_label}</div>
+    <div class='verdict-price'>{v.median_usd_t:,.0f}<span class='u'> /т</span></div>
+    <div class='verdict-rub'>p10–p90: {v.p10_usd_t:,.0f} – {v.p90_usd_t:,.0f} USD/т</div>
+    <div class='verdict-tag' style='background:{tone_bg};color:{v.color}'>
+      <span style='font-size:24px'>{v.icon}</span> {v.label}
+      <span style='font-weight:600;color:#7F8B93'>· {v.ru}</span>
+    </div>
+    <div class='verdict-sub'>{v.headline}</div>
+    <div style='margin-top:14px;display:flex;align-items:center;gap:10px'>
+      <span style='font-size:12px;color:#7F8B93;text-transform:uppercase;letter-spacing:.06em'>Уверенность модели</span>
+      {_conf_light(v.confidence, v.color)}
+      <span style='font-family:JetBrains Mono,monospace;font-weight:700;color:{v.color}'>{v.confidence}%</span>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    # --- Метрики сравнения ---
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Текущий спот", f"{spot_t:,.0f} USD/т")
+    m2.metric("Прогноз к сроку", f"{v.median_usd_t:,.0f} USD/т",
+              f"{v.change_pct:+.1f}%")
+    band = (v.p90_usd_t - v.p10_usd_t) / 2 / v.median_usd_t * 100
+    m3.metric("Размах коридора 80%", f"±{band:.1f}%")
+
+    # --- Почему такой совет ---
+    with st.expander("❓ Почему такой совет", expanded=True):
+        st.write(v.why)
+        factors = buyer_factors(raw)
+        if factors:
+            cmap = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}
+            chips = "".join(
+                f"<span class='factor-chip'><span class='b' style='background:{cmap[f['tone']]}'></span>"
+                f"{f['title']}: <b>&nbsp;{f['value']}</b></span>"
+                for f in factors
+            )
+            st.markdown(chips, unsafe_allow_html=True)
+
+    # --- Коридор + календарь рисков ---
+    col_cor, col_risk = st.columns([1, 1])
+    with col_cor:
+        st.markdown("##### ⇆ Целевая цена и коридор")
+        # Горизонтальная полоса коридора через plotly
+        fig_b = go.Figure()
+        fig_b.add_trace(go.Scatter(
+            x=[v.p10_usd_t, v.p90_usd_t], y=[0, 0], mode="lines",
+            line=dict(color=v.color, width=18), opacity=0.25, showlegend=False,
+            hoverinfo="skip"))
+        fig_b.add_trace(go.Scatter(
+            x=[v.median_usd_t], y=[0], mode="markers",
+            marker=dict(color=v.color, size=20, line=dict(color="white", width=2)),
+            showlegend=False,
+            hovertemplate="Прогноз: %{x:,.0f} USD/т<extra></extra>"))
+        fig_b.add_trace(go.Scatter(
+            x=[spot_t], y=[0], mode="markers",
+            marker=dict(color="#001829", size=14, symbol="line-ns",
+                        line=dict(color="#001829", width=3)),
+            showlegend=False,
+            hovertemplate="Сейчас: %{x:,.0f} USD/т<extra></extra>"))
+        fig_b.update_layout(
+            height=120, margin=dict(l=10, r=10, t=10, b=30),
+            yaxis=dict(visible=False, range=[-1, 1]),
+            xaxis=dict(title="USD/т", showgrid=True),
+        )
+        st.plotly_chart(fig_b, use_container_width=True)
+        st.caption(f"Синяя зона — где цена окажется в 8 из 10 случаев. "
+                   f"Тёмная метка — текущий спот ({spot_t:,.0f}).")
+
+    with col_risk:
+        st.markdown("##### ◷ Календарь рисков")
+        try:
+            ups = get_upcoming_events(days_ahead=45, min_importance="medium")[:5]
+            for ev in ups:
+                arrow = ev.impact_arrow or ""
+                color = {"high": "#E00613", "medium": "#F59E0B",
+                         "low": "#7F8B93"}.get(ev.importance, "#7F8B93")
+                st.markdown(
+                    f"<div style='display:flex;gap:10px;padding:6px 0;border-bottom:1px solid #E1E5E9'>"
+                    f"<span style='color:{color};font-weight:700;min-width:64px'>через {ev.days_until} дн.</span>"
+                    f"<span style='color:#001829'>{ev.title} "
+                    f"<span style='color:#7F8B93'>· {ev.impact_copper or ''} {arrow}</span></span></div>",
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            st.caption("Календарь временно недоступен.")
+
+    st.caption("⚠️ Прогноз — ансамбль 4 моделей с квантильным коридором. "
+               "Не является инвестиционной рекомендацией.")
+
+
+if app_mode == "🛒 Закупщик":
+    render_buyer()
+    st.stop()   # не рисуем интерфейс эксперта
+
+
+# ============================================================
+#  Header (режим Эксперта)
 # ============================================================
 
 st.title("🟫 Прогноз цены меди — MVP")

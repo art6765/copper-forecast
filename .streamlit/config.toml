@@ -2,12 +2,12 @@
 # https://docs.streamlit.io/library/advanced-features/configuration
 
 [theme]
-# Тема: navy + copper, как в презентации
+# Корпоративная палитра Акрон Холдинг: тёмно-синий #001829 + красный #E00613
 base = "light"
-primaryColor = "#B87333"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F7F8FB"
-textColor = "#242938"
+primaryColor = "#E00613"
+backgroundColor = "#F2F5F7"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#001829"
 font = "sans serif"
 
 [server]
