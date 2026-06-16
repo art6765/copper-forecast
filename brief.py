@@ -44,36 +44,45 @@ DEFAULT_MODEL = "deepseek-chat"
 #  Конфигурация и ключ
 # ---------------------------------------------------------------------------
 
-def _load_env_file() -> None:
-    """Подхватить .env рядом с модулем (KEY=VALUE), не перезаписывая os.environ."""
+def _read_env_file() -> Dict[str, str]:
+    """Прочитать .env рядом с модулем в словарь — СВЕЖО при каждом вызове.
+
+    Важно: НЕ пишем в os.environ (никакого setdefault). Иначе долгоживущий
+    процесс (Streamlit-сервис) закэширует первое значение и не увидит
+    обновлённый .env без перезапуска — что и приводило к «застрявшему» ключу.
+    """
     env_path = BASE_DIR / ".env"
+    out: Dict[str, str] = {}
     if not env_path.exists():
-        return
+        return out
     try:
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            out[k.strip()] = v.strip().strip('"').strip("'")
     except Exception as exc:
         logger.warning("Не удалось прочитать .env: %s", exc)
+    return out
+
+
+def _cfg(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Значение настройки: приоритет у переменных окружения, затем свежий .env."""
+    return os.environ.get(name) or _read_env_file().get(name, default)
 
 
 def get_api_key() -> Optional[str]:
     """Ключ из BRIEF_API_KEY или DEEPSEEK_API_KEY (env или .env)."""
-    _load_env_file()
-    return os.environ.get("BRIEF_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    return _cfg("BRIEF_API_KEY") or _cfg("DEEPSEEK_API_KEY")
 
 
 def _base_url() -> str:
-    _load_env_file()
-    return os.environ.get("BRIEF_LLM_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    return (_cfg("BRIEF_LLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
 
 
 def _model() -> str:
-    _load_env_file()
-    return os.environ.get("BRIEF_LLM_MODEL", DEFAULT_MODEL)
+    return _cfg("BRIEF_LLM_MODEL") or DEFAULT_MODEL
 
 
 # ---------------------------------------------------------------------------
