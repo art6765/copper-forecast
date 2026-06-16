@@ -85,6 +85,12 @@ def _model() -> str:
     return _cfg("BRIEF_LLM_MODEL") or DEFAULT_MODEL
 
 
+def get_config(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Публичный доступ к настройке из env/.env (используется и в app.py,
+    например для логина/пароля авторизации)."""
+    return _cfg(name, default)
+
+
 # ---------------------------------------------------------------------------
 #  Вызов LLM (OpenAI-совместимый /chat/completions через urllib)
 # ---------------------------------------------------------------------------

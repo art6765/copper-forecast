@@ -192,6 +192,36 @@ def cached_backtest(years: int, train_min_days: int, step_days: int,
 st.set_page_config(page_title="CopperCast — прогноз цены меди",
                    page_icon="🟫", layout="wide")
 
+
+# ============================================================
+#  Авторизация. Активна, ТОЛЬКО если в .env/окружении задан AKRON_PASSWORD.
+#  Пароль в коде не хранится — здесь лишь сверка. Без пароля доступ открыт
+#  (как раньше), чтобы случайно не заблокировать себя.
+# ============================================================
+def _auth_gate():
+    exp_pass = brief.get_config("AKRON_PASSWORD")
+    if not exp_pass:
+        return  # авторизация выключена
+    if st.session_state.get("auth_ok"):
+        return
+    exp_login = (brief.get_config("AKRON_LOGIN") or "akron").strip().lower()
+    st.markdown("## 🔒 CopperCast — вход")
+    st.caption("Доступ к дашборду ограничен. Введите логин и пароль.")
+    with st.form("login_form"):
+        u = st.text_input("Логин")
+        p = st.text_input("Пароль", type="password")
+        ok = st.form_submit_button("Войти")
+    if ok:
+        if u.strip().lower() == exp_login and p == exp_pass:
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Неверный логин или пароль.")
+    st.stop()
+
+
+_auth_gate()
+
 # ============================================================
 #  Корпоративный стиль Акрон Холдинг (CSS-инъекция)
 # ============================================================
