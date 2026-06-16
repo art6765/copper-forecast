@@ -45,6 +45,7 @@ from buyer_logic import (
     compute_verdict, all_verdicts, buyer_factors, VERDICT_META,
 )
 import history_db
+import brief
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -1695,11 +1696,55 @@ with tab_season:
 with tab_news:
     st.subheader("📰 Новости и события рынка меди")
 
-    sub_calendar, sub_news, sub_events = st.tabs([
+    sub_brief, sub_calendar, sub_news, sub_events = st.tabs([
+        "🤖 ИИ-брифинг",
         "📅 Календарь (предстоящие)",
         "📡 Свежие новости (RSS)",
         "🗂️ Каталог событий 2020-2026",
     ])
+
+    # ---- ИИ-брифинг по рынку меди (LLM курирует свежие заголовки) ----
+    with sub_brief:
+        st.caption(
+            "Ежедневная ИИ-сводка: модель отбирает значимое из свежих заголовков "
+            "(лента RSS) и собирает краткий брифинг для отдела закупок. "
+            "Обновляется автоматически по утрам на сервере."
+        )
+        _has_key = bool(brief.get_api_key())
+        bc1, bc2 = st.columns([1, 2])
+        with bc1:
+            if st.button("🔄 Сгенерировать сейчас", disabled=not _has_key,
+                         help=None if _has_key else "Не задан API-ключ на сервере"):
+                try:
+                    with st.spinner("Модель готовит брифинг…"):
+                        _res = brief.generate_brief()
+                        brief.save_brief(_res)
+                    st.success(f"Готово (учтено новостей: {_res['n_news']})")
+                    st.rerun()
+                except Exception as _exc:
+                    st.error(f"Ошибка генерации: {_exc}")
+        with bc2:
+            if not _has_key:
+                st.warning(
+                    "API-ключ не задан на сервере — кнопка и авто-генерация отключены. "
+                    "Добавьте ключ в файл `.env` рядом с проектом (см. инструкцию).")
+
+        _latest = brief.latest_brief()
+        if _latest:
+            st.caption(f"🕒 Обновлено: {_latest['generated']:%Y-%m-%d %H:%M}")
+            st.markdown(_latest["markdown"])
+            _briefs = brief.list_briefs()
+            if len(_briefs) > 1:
+                with st.expander("📚 Архив брифингов"):
+                    _pick = st.selectbox("Дата брифинга",
+                                         [b["date"] for b in _briefs], key="brief_pick")
+                    _sel = next((b for b in _briefs if b["date"] == _pick), None)
+                    if _sel:
+                        st.markdown(brief.read_brief(_sel["path"]))
+        else:
+            st.info(
+                "Брифинг ещё не сгенерирован. Если API-ключ задан — нажмите "
+                "«Сгенерировать сейчас» или дождитесь утреннего автозапуска (cron).")
 
     # ---- Календарь предстоящих событий ----
     with sub_calendar:

@@ -18,6 +18,10 @@ data/cache_*.csv
 data/forecast_history.sqlite
 data/*.sqlite
 
+# ИИ-брифинги (генерируются на сервере) и секреты (API-ключи)
+data/briefings/
+.env
+
 # Outputs (генерируются при запуске forecast.py)
 outputs/forecasts.csv
 outputs/backtest_metrics.csv
