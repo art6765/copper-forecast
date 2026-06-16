@@ -14,6 +14,10 @@ env/
 # Cache данных (будут перегенерированы при первом запуске)
 data/cache_*.csv
 
+# Журнал прогнозов (SQLite) — персистентная история, не коммитим
+data/forecast_history.sqlite
+data/*.sqlite
+
 # Outputs (генерируются при запуске forecast.py)
 outputs/forecasts.csv
 outputs/backtest_metrics.csv

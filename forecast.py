@@ -194,6 +194,19 @@ def main(argv=None):
     raw["copper"].tail(252).to_csv(OUT_DIR / "history.csv", header=True)
     logger.info("Прогнозы сохранены: %s", OUT_DIR / "forecasts.csv")
 
+    # ---- 2b. Журнал прогнозов (SQLite) ----
+    # Запись текущего прогноза в персистентный журнал + сверка наступивших
+    # горизонтов с фактом. Идемпотентно (1 запись на дату×модель×горизонт).
+    try:
+        import history_db
+        jr = history_db.record_live_forecast(
+            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"]
+        )
+        logger.info("Журнал прогнозов: +%d записано, %d сверено с фактом",
+                    jr.get("logged", 0), jr.get("resolved", 0))
+    except Exception as exc:
+        logger.warning("Журнал прогнозов недоступен: %s", exc)
+
     # ---- 3. Графики ----
     try:
         _plot_forecasts(raw, df_fc, OUT_DIR / "plots" / "forecast.png", "Ensemble")

@@ -44,6 +44,7 @@ from upcoming_events import (
 from buyer_logic import (
     compute_verdict, all_verdicts, buyer_factors, VERDICT_META,
 )
+import history_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -347,6 +348,24 @@ else:
     raw, results, df_fc, xgb_explanations = cached_forecast(
         sig, years, use_xgb, use_mlp, use_arima, use_gbm
     )
+
+
+# ============================================================
+#  Журнал реальных прогнозов (SQLite) — только в режиме «Сейчас».
+#  В историческом режиме не пишем, чтобы не засорять журнал ретроспективой.
+#  Запись идемпотентна (1 строка на дату×модель×горизонт), сбой журнала
+#  не должен ломать приложение — оборачиваем в try/except.
+# ============================================================
+if not historical_mode:
+    try:
+        _jr = history_db.record_live_forecast(
+            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"]
+        )
+        if _jr.get("logged") or _jr.get("resolved"):
+            logging.info("Журнал прогнозов: +%d записано, %d сверено с фактом",
+                         _jr.get("logged", 0), _jr.get("resolved", 0))
+    except Exception as _exc:
+        logging.warning("Журнал прогнозов недоступен: %s", _exc)
 
 # Применим пользовательские или адаптивные веса к ансамблю
 def _get_active_weights() -> Dict[str, float]:
@@ -672,9 +691,11 @@ st.markdown("---")
 #  Tabs
 # ============================================================
 
-tab_fc, tab_macro, tab_cot, tab_regimes, tab_season, tab_news, tab_bt, tab_raw = st.tabs(
+(tab_fc, tab_macro, tab_cot, tab_regimes, tab_season, tab_news, tab_bt,
+ tab_accuracy, tab_raw) = st.tabs(
     ["📈 Прогноз", "🌐 История и макро", "📋 COT и запасы", "🎭 Режимы",
-     "🗓️ Сезонность", "📰 Новости и события", "🔍 Back-test", "📊 Сырые данные"]
+     "🗓️ Сезонность", "📰 Новости и события", "🔍 Back-test",
+     "📒 Точность", "📊 Сырые данные"]
 )
 
 
@@ -2129,3 +2150,210 @@ with tab_raw:
         file_name="copper_market_data.csv",
         mime="text/csv",
     )
+
+
+# ----- TAB: Точность (реальный журнал прогнозов) -----
+with tab_accuracy:
+    st.subheader("📒 Точность прогнозов — реальный журнал")
+    st.caption(
+        "В отличие от Back-test (синтетическая проверка по требованию), здесь "
+        "копится журнал **настоящих** прогнозов системы. Когда наступает целевая "
+        "дата горизонта и становится известна фактическая цена, прогноз сверяется "
+        "с фактом: угадано ли направление, попал ли факт в коридор p10-p90, какова ошибка."
+    )
+
+    try:
+        _stats = history_db.get_stats()
+    except Exception as exc:
+        st.error(f"Журнал недоступен: {exc}")
+        _stats = None
+
+    if _stats is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Всего прогнозов", _stats["total"])
+        c2.metric("Сверено с фактом", _stats["resolved"])
+        c3.metric("Ожидают факта", _stats["pending"])
+        c4.metric("Период журнала",
+                  f"{_stats['first_date']} … {_stats['last_date']}"
+                  if _stats["first_date"] else "пусто")
+        if _stats["backfill"]:
+            st.caption(f"Источник: {_stats['live']} реальных (live) + "
+                       f"{_stats['backfill']} исторических (backfill).")
+
+        # --- Сервис: наполнение журнала из back-test ---
+        with st.expander("⚙️ Наполнить журнал историческими прогнозами "
+                         "(чтобы увидеть аналитику сразу)"):
+            st.markdown(
+                "Реальный журнал копится постепенно: прогноз на 3 дня сверится через "
+                "3 торговых дня, на 6 месяцев — только через полгода. Чтобы увидеть "
+                "аналитику точности **немедленно**, засейте журнал ретроспективными "
+                "прогнозами из walk-forward back-test (они сразу сверены с фактом)."
+            )
+            cc1, cc2 = st.columns([1, 1])
+            with cc1:
+                if st.button("🔄 Наполнить из back-test"):
+                    try:
+                        _bt = st.session_state.get("bt_result")
+                        if _bt is None:
+                            with st.spinner("Запускаю back-test (~1-3 мин)…"):
+                                _bt = cached_backtest(years, 600, 20, use_xgb, use_arima)
+                        n_added = history_db.log_walkforward(_bt["predictions"])
+                        st.success(f"Добавлено в журнал: {n_added} исторических прогнозов.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Не удалось наполнить: {exc}")
+            with cc2:
+                if st.button("🗑️ Очистить backfill-записи"):
+                    n = history_db.clear(source="backfill")
+                    st.success(f"Удалено backfill-записей: {n}")
+                    st.rerun()
+
+        st.markdown("---")
+
+        if _stats["resolved"] == 0:
+            st.info(
+                "Пока нет ни одного прогноза, сверенного с фактом. Либо журнал только "
+                "начал копиться (вернитесь позже, когда наступят целевые даты), либо "
+                "наполните его из back-test в блоке выше."
+            )
+        else:
+            _log_all = history_db.load_log(resolved_only=True)
+            models_avail = sorted(_log_all["model"].dropna().unique().tolist())
+            default_model = ("Ensemble" if "Ensemble" in models_avail
+                             else (models_avail[0] if models_avail else None))
+
+            sub_summary, sub_vs, sub_log = st.tabs(
+                ["📊 Сводка по горизонтам", "📈 Прогноз vs факт", "📒 Журнал"]
+            )
+
+            # ===== Сводка по горизонтам =====
+            with sub_summary:
+                summ = history_db.accuracy_summary()
+                if summ.empty:
+                    st.info("Недостаточно данных для сводки.")
+                else:
+                    disp = summ.copy()
+                    disp["MAE, USD/т"] = (disp["mae"] * LB_PER_TON).round(0)
+                    disp["Bias, USD/т"] = (disp["bias"] * LB_PER_TON).round(0)
+                    disp = disp.rename(columns={
+                        "model": "Модель", "horizon_label": "Горизонт", "n": "N",
+                        "hit_rate": "Hit Rate, %", "coverage80": "Coverage80, %",
+                        "mape": "MAPE, %",
+                    })
+                    disp["Hit Rate, %"] = disp["Hit Rate, %"].round(1)
+                    disp["Coverage80, %"] = disp["Coverage80, %"].round(1)
+                    disp["MAPE, %"] = disp["MAPE, %"].round(2)
+                    cols = ["Модель", "Горизонт", "N", "Hit Rate, %",
+                            "Coverage80, %", "MAPE, %", "MAE, USD/т", "Bias, USD/т"]
+                    st.dataframe(disp[cols], use_container_width=True, hide_index=True)
+
+                    msel = st.selectbox(
+                        "Модель для графика", models_avail,
+                        index=(models_avail.index(default_model)
+                               if default_model in models_avail else 0))
+                    sub = summ[summ["model"] == msel].sort_values("horizon_days")
+                    if not sub.empty:
+                        fig = go.Figure()
+                        fig.add_bar(x=sub["horizon_label"], y=sub["hit_rate"],
+                                    name="Hit Rate, %", marker_color="#E00613")
+                        fig.add_bar(x=sub["horizon_label"], y=sub["coverage80"],
+                                    name="Coverage80, %", marker_color="#001829")
+                        fig.add_hline(y=50, line_dash="dash", line_color="gray",
+                                      annotation_text="50% (случайность)")
+                        fig.update_layout(
+                            barmode="group", height=380,
+                            title=f"Попадание по горизонтам — {msel}",
+                            yaxis_title="%", margin=dict(l=10, r=10, t=50, b=10),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                        xanchor="right", x=1))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.caption(
+                            "**Hit Rate** — доля угаданных направлений (рост/падение); "
+                            ">50% значит модель полезнее подбрасывания монеты. "
+                            "**Coverage80** в идеале ≈80% (столько раз факт должен "
+                            "попадать в заявленный коридор p10-p90). "
+                            "**Bias** >0 — модель в среднем завышает цену."
+                        )
+
+            # ===== Прогноз vs факт =====
+            with sub_vs:
+                cvs1, cvs2 = st.columns([1, 1])
+                with cvs1:
+                    m_vs = st.selectbox(
+                        "Модель", models_avail, key="vs_model",
+                        index=(models_avail.index(default_model)
+                               if default_model in models_avail else 0))
+                with cvs2:
+                    h_pick = st.selectbox("Горизонт", [h["label"] for h in HORIZONS],
+                                          key="vs_horizon")
+                h_days_pick = next(h["days"] for h in HORIZONS if h["label"] == h_pick)
+                d = history_db.load_log(resolved_only=True, model=m_vs,
+                                        horizon_days=h_days_pick)
+                if d.empty:
+                    st.info("Нет сверенных прогнозов для этой комбинации.")
+                else:
+                    d = d.sort_values("actual_date")
+                    ad = pd.to_datetime(d["actual_date"])
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=ad, y=d["p90"] * LB_PER_TON, mode="lines",
+                        line=dict(width=0), showlegend=False, hoverinfo="skip"))
+                    fig.add_trace(go.Scatter(
+                        x=ad, y=d["p10"] * LB_PER_TON, mode="lines", fill="tonexty",
+                        fillcolor="rgba(224,6,19,0.12)", line=dict(width=0),
+                        name="Коридор p10-p90"))
+                    fig.add_trace(go.Scatter(
+                        x=ad, y=d["point"] * LB_PER_TON, mode="lines+markers",
+                        line=dict(color="#E00613", dash="dot"), name="Прогноз"))
+                    fig.add_trace(go.Scatter(
+                        x=ad, y=d["actual_price"] * LB_PER_TON, mode="lines+markers",
+                        line=dict(color="#001829"), name="Факт"))
+                    fig.update_layout(
+                        height=420, title=f"{m_vs} · {h_pick}: прогноз vs факт",
+                        xaxis_title="Дата исполнения", yaxis_title="Цена меди, USD/т",
+                        margin=dict(l=10, r=10, t=50, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="right", x=1))
+                    st.plotly_chart(fig, use_container_width=True)
+                    mm1, mm2, mm3 = st.columns(3)
+                    mm1.metric("Hit Rate", f"{d['direction_correct'].mean() * 100:.0f}%")
+                    mm2.metric("Coverage80", f"{d['in_interval_80'].mean() * 100:.0f}%")
+                    mm3.metric("MAPE", f"{d['pct_error'].mean():.2f}%")
+
+            # ===== Журнал =====
+            with sub_log:
+                fc1, fc2, fc3 = st.columns(3)
+                with fc1:
+                    flt_model = st.selectbox("Модель", ["(все)"] + models_avail,
+                                             key="log_model")
+                with fc2:
+                    flt_h = st.selectbox("Горизонт",
+                                         ["(все)"] + [h["label"] for h in HORIZONS],
+                                         key="log_h")
+                with fc3:
+                    only_res = st.checkbox("Только сверенные с фактом", value=True)
+                m_arg = None if flt_model == "(все)" else flt_model
+                hd_arg = (None if flt_h == "(все)"
+                          else next(h["days"] for h in HORIZONS if h["label"] == flt_h))
+                dlog = history_db.load_log(resolved_only=only_res, model=m_arg,
+                                           horizon_days=hd_arg, limit=2000)
+                if dlog.empty:
+                    st.info("Журнал пуст для выбранных фильтров.")
+                else:
+                    view = pd.DataFrame({
+                        "База": dlog["as_of_date"],
+                        "Гориз.": dlog["horizon_label"],
+                        "Модель": dlog["model"],
+                        "Прогноз, USD/т": (dlog["point"] * LB_PER_TON).round(0),
+                        "Факт, USD/т": (dlog["actual_price"] * LB_PER_TON).round(0),
+                        "Напр.": dlog["direction_correct"].map({1: "✅", 0: "❌"}),
+                        "В коридоре": dlog["in_interval_80"].map({1: "✅", 0: "❌"}),
+                        "Ошибка, %": dlog["pct_error"].round(2),
+                        "Источник": dlog["source"],
+                    })
+                    st.dataframe(view, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "📥 Скачать журнал CSV",
+                        data=dlog.to_csv(index=False).encode("utf-8"),
+                        file_name="forecast_history.csv", mime="text/csv",
+                    )
