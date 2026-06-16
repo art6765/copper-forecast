@@ -88,6 +88,14 @@ def chat_completion(messages: List[Dict], temperature: float = 0.3,
         raise RuntimeError(
             "Нет API-ключа. Задайте DEEPSEEK_API_KEY в окружении "
             "или в файле .env рядом с brief.py")
+    key = key.strip()
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        raise RuntimeError(
+            "API-ключ содержит недопустимые символы — похоже, в .env остался "
+            "текст-заглушка вместо настоящего ключа. Впишите в .env реальный "
+            "ключ DeepSeek (начинается с 'sk-').")
     url = f"{_base_url()}/chat/completions"
     payload = {
         "model": _model(),
