@@ -22,6 +22,9 @@ data/*.sqlite
 data/briefings/
 .env
 
+# Резервные снапшоты данных (создаются на сервере)
+data/backups/
+
 # Outputs (генерируются при запуске forecast.py)
 outputs/forecasts.csv
 outputs/backtest_metrics.csv
