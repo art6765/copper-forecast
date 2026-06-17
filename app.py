@@ -2481,17 +2481,27 @@ with tab_lme:
             except Exception as _exc:
                 st.error(f"Не удалось пересчитать прогноз в LME: {_exc}")
 
-        # 2) Прямой GBM на ряду LME 3M
-        st.markdown("### 📐 Прямой GBM на ряду LME 3M (второе мнение)")
-        _gbm_lme = lf.forecast_lme_gbm(raw)
-        if _gbm_lme.empty:
-            st.info(f"Недостаточно данных LME для GBM (нужно ≥{lf.GBM_MIN_DAYS} дн., "
-                    f"есть {_lst['n_days']}).")
+        # 2) Прямой прогноз на ряду LME 3M (авто-дозревание моделей)
+        st.markdown("### 📐 Прямой прогноз на ряду LME 3M (авто-дозревание)")
+        _lme_df, _lme_models = lf.forecast_lme_direct(raw)
+        if _lme_df.empty:
+            st.info(f"Недостаточно данных LME для прямого прогноза "
+                    f"(нужно ≥{lf.GBM_MIN_DAYS} дн., есть {_lst['n_days']}).")
         else:
-            st.caption("Считается напрямую по накопленному ряду LME 3M, без опоры на "
-                       "COMEX. Надёжно для коротких горизонтов (3–10 дней), на длинных — "
-                       "ориентировочно.")
-            st.dataframe(_gbm_lme, use_container_width=True, hide_index=True)
+            _next = []
+            if not _lst["arima_ok"]:
+                _next.append(f"ARIMA — через ~{lf.ARIMA_MIN_DAYS - _lst['n_days']} дн.")
+            if not _lst["ml_ok"]:
+                _next.append(f"ML (XGBoost/MLP) — через ~{_lst['ml_eta_days']} дн.")
+            _cap = f"Активные модели на LME: **{', '.join(_lme_models)}**."
+            if _next:
+                _cap += " Подключатся сами по мере накопления: " + "; ".join(_next) + "."
+            _cap += " Считается напрямую по ряду LME 3M, без опоры на COMEX."
+            st.caption(_cap)
+            _show = [c for c in ["Горизонт", "Модель", "P0, USD/т", "p10, USD/т",
+                                 "Точечный, USD/т", "p90, USD/т", "Δ, %", "P(↑), %"]
+                     if c in _lme_df.columns]
+            st.dataframe(_lme_df[_show], use_container_width=True, hide_index=True)
 
         # 3) График COMEX vs LME 3M
         st.markdown("### 📈 COMEX vs LME 3M (накопленный период)")

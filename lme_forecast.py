@@ -26,7 +26,8 @@ from typing import Dict, Optional
 import pandas as pd
 
 from data_loader import LB_PER_TON
-from models import HORIZONS, forecast_gbm
+from models import (HORIZONS, forecast_gbm,
+                    forecast_all_horizons, forecasts_to_dataframe)
 
 # Пороги доступности моделей по числу накопленных дневных точек LME.
 GBM_MIN_DAYS = 60       # GBM: дрейф+волатильность за 60 дней
@@ -116,6 +117,61 @@ def forecast_lme_gbm(raw: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
     return pd.DataFrame(rows)
+
+
+def _lme_as_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """Копия raw с целевым рядом = LME 3M (USD/т) вместо COMEX, выровненная по
+    датам LME. Позволяет переиспользовать build_features / forecast_all_horizons
+    для прямого обучения моделей на LME."""
+    lme = lme_series(raw)
+    sub = raw.reindex(lme.index).copy()
+    sub["copper"] = lme
+    # OHLC/объём меди не относятся к LME — убираем (ATR-фичи выпадут штатно)
+    for col in ["copper_high", "copper_low", "copper_volume"]:
+        if col in sub.columns:
+            sub = sub.drop(columns=col)
+    return sub
+
+
+def forecast_lme_direct(raw: pd.DataFrame):
+    """Прямой прогноз на накопленном ряду LME 3M с АВТО-ДОЗРЕВАНИЕМ.
+
+    Модели включаются сами по мере накопления данных (через data_status):
+        GBM         — от GBM_MIN_DAYS (60),
+        ARIMA       — от ARIMA_MIN_DAYS (150),
+        XGBoost/MLP — от ML_MIN_DAYS (200).
+    Переиспользует движок forecast_all_horizons на ряду LME (подмена copper),
+    поэтому по мере роста кэша более сложные модели подключаются автоматически.
+
+    Возвращает (df, models_used):
+        df — таблица forecasts_to_dataframe, цены в USD/т (ряд LME уже в USD/т);
+        models_used — список включённых моделей.
+    """
+    status = data_status(raw)
+    if not status["gbm_ok"]:
+        return pd.DataFrame(), []
+    try:
+        lme_raw = _lme_as_raw(raw)
+        results = forecast_all_horizons(
+            lme_raw,
+            use_gbm=True,
+            use_arima=status["arima_ok"],
+            use_xgb=status["ml_ok"],
+            use_mlp=status["ml_ok"],
+        )
+        df = forecasts_to_dataframe(results)
+    except Exception:
+        return pd.DataFrame(), []
+    if df.empty:
+        return df, []
+    # Значения уже в USD/т (ряд LME в USD/т) — переименуем колонки для ясности
+    df = df.rename(columns={
+        "P0, USD/lb": "P0, USD/т", "Точечный": "Точечный, USD/т",
+        "Медиана": "Медиана, USD/т", "p10": "p10, USD/т", "p25": "p25, USD/т",
+        "p75": "p75, USD/т", "p90": "p90, USD/т",
+    })
+    models_used = sorted(df["Модель"].dropna().unique().tolist())
+    return df, models_used
 
 
 def comex_lme_compare(raw: pd.DataFrame, days: int = 120) -> pd.DataFrame:
