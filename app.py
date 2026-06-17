@@ -46,6 +46,7 @@ from buyer_logic import (
 )
 import history_db
 import brief
+import lme_forecast as lf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -723,10 +724,10 @@ st.markdown("---")
 # ============================================================
 
 (tab_fc, tab_macro, tab_cot, tab_regimes, tab_season, tab_news, tab_bt,
- tab_accuracy, tab_raw) = st.tabs(
+ tab_accuracy, tab_lme, tab_raw) = st.tabs(
     ["📈 Прогноз", "🌐 История и макро", "📋 COT и запасы", "🎭 Режимы",
      "🗓️ Сезонность", "📰 Новости и события", "🔍 Back-test",
-     "📒 Точность", "📊 Сырые данные"]
+     "📒 Точность", "🌍 LME (β)", "📊 Сырые данные"]
 )
 
 
@@ -2432,3 +2433,83 @@ with tab_accuracy:
                         data=dlog.to_csv(index=False).encode("utf-8"),
                         file_name="forecast_history.csv", mime="text/csv",
                     )
+
+
+# ----- TAB: LME 3M (бета) -----
+with tab_lme:
+    st.subheader("🌍 Прогноз LME 3M (бета)")
+    st.caption(
+        "LME 3M — глобальный бенчмарк меди (COMEX искажён тарифами США 2025). "
+        "История LME копится с нуля через Westmetall, поэтому LME-модель «дозревает»: "
+        "пока данных мало, прогноз строится через зрелую COMEX-модель + премию."
+    )
+
+    _lst = lf.data_status(raw)
+    if _lst["n_days"] == 0:
+        st.warning("Данные LME 3M ещё не накоплены (источник — Westmetall).")
+    else:
+        st.markdown(
+            f"**Накоплено LME 3M:** {_lst['n_days']} дн. "
+            f"({_lst['first']} … {_lst['last']})"
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("GBM", "✅ доступен" if _lst["gbm_ok"] else "⏳ рано")
+        m2.metric("ARIMA", "✅ доступен" if _lst["arima_ok"] else "⏳ с 150 дн.")
+        m3.metric("ML (XGB/MLP)", "✅ доступен" if _lst["ml_ok"]
+                  else f"⏳ ещё ~{_lst['ml_eta_days']} дн.")
+
+        st.markdown("---")
+
+        # 1) Основной прогноз — COMEX-модель, приведённая к LME
+        st.markdown("### 🎯 Основной прогноз — COMEX-модель, приведённая к LME")
+        _prem = lf.current_premium_pct(raw)
+        if _prem is None:
+            st.info("Премия COMEX–LME недоступна (нет данных Westmetall).")
+        else:
+            st.caption(
+                f"Текущая премия COMEX над LME 3M: **{_prem:+.1f}%**. Прогноз зрелой "
+                "COMEX-модели (ансамбль) переведён в LME-эквивалент. Допущение: "
+                "премия сохранится на горизонте."
+            )
+            try:
+                _ens = df_fc[df_fc["Модель"] == "Ensemble"]
+                _lme_main = lf.comex_to_lme_df(_ens, _prem)
+                _cols = [c for c in ["Горизонт", "P0, USD/т", "p10, USD/т",
+                                     "Точечный, USD/т", "p90, USD/т", "Δ, %", "P(↑), %"]
+                         if c in _lme_main.columns]
+                st.dataframe(_lme_main[_cols], use_container_width=True, hide_index=True)
+            except Exception as _exc:
+                st.error(f"Не удалось пересчитать прогноз в LME: {_exc}")
+
+        # 2) Прямой GBM на ряду LME 3M
+        st.markdown("### 📐 Прямой GBM на ряду LME 3M (второе мнение)")
+        _gbm_lme = lf.forecast_lme_gbm(raw)
+        if _gbm_lme.empty:
+            st.info(f"Недостаточно данных LME для GBM (нужно ≥{lf.GBM_MIN_DAYS} дн., "
+                    f"есть {_lst['n_days']}).")
+        else:
+            st.caption("Считается напрямую по накопленному ряду LME 3M, без опоры на "
+                       "COMEX. Надёжно для коротких горизонтов (3–10 дней), на длинных — "
+                       "ориентировочно.")
+            st.dataframe(_gbm_lme, use_container_width=True, hide_index=True)
+
+        # 3) График COMEX vs LME 3M
+        st.markdown("### 📈 COMEX vs LME 3M (накопленный период)")
+        _cmp = lf.comex_lme_compare(raw, days=_lst["n_days"])
+        if not _cmp.empty:
+            _fig = go.Figure()
+            for _col, _color in [("COMEX (USD/т)", "#E00613"),
+                                 ("LME 3M (USD/т)", "#001829")]:
+                if _col in _cmp.columns:
+                    _fig.add_trace(go.Scatter(x=_cmp.index, y=_cmp[_col], mode="lines",
+                                              name=_col, line=dict(color=_color)))
+            _fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
+                               yaxis_title="USD/т",
+                               legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                           xanchor="right", x=1))
+            st.plotly_chart(_fig, use_container_width=True)
+            st.caption("Расхождение линий = премия COMEX над LME (тарифное искажение 2025).")
+
+        st.info("⚠️ Бета. По мере накопления истории LME автоматически подключатся "
+                "ARIMA и ML (Этапы 3–4), а журнал точности будет отдельно отслеживать "
+                "качество LME-прогноза.")
