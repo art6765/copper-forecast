@@ -71,6 +71,7 @@ _COLUMNS = [
     "p10", "p25", "p75", "p90", "change_pct", "prob_up", "sigma_t", "source",
     "resolved", "resolved_at", "actual_date", "actual_price",
     "abs_error", "pct_error", "signed_error", "direction_correct", "in_interval_80",
+    "market",
 ]
 
 
@@ -87,47 +88,74 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    """Создать таблицу и индексы, если их ещё нет."""
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS forecast_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_date      TEXT NOT NULL,
+    created_at      TEXT,
+    model           TEXT NOT NULL,
+    horizon_key     TEXT,
+    horizon_label   TEXT,
+    horizon_days    INTEGER NOT NULL,
+    target_date     TEXT,
+    p0              REAL,
+    point           REAL,
+    median          REAL,
+    p10             REAL,
+    p25             REAL,
+    p75             REAL,
+    p90             REAL,
+    change_pct      REAL,
+    prob_up         REAL,
+    sigma_t         REAL,
+    source          TEXT DEFAULT 'live',
+    resolved        INTEGER DEFAULT 0,
+    resolved_at     TEXT,
+    actual_date     TEXT,
+    actual_price    REAL,
+    abs_error       REAL,
+    pct_error       REAL,
+    signed_error    REAL,
+    direction_correct INTEGER,
+    in_interval_80  INTEGER,
+    market          TEXT DEFAULT 'COMEX',   -- COMEX | LME
+    UNIQUE(as_of_date, model, horizon_days, source, market)
+)
+"""
+
+
+def _migrate_add_market(conn: sqlite3.Connection) -> None:
+    """Миграция старой схемы (без market) → новая. Старые записи помечаются COMEX,
+    UNIQUE расширяется на market. Данные не теряются."""
+    conn.execute("ALTER TABLE forecast_log RENAME TO _forecast_log_old")
+    conn.execute(_SCHEMA_SQL)
+    old_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(_forecast_log_old)").fetchall()]
+    common = [c for c in old_cols if c != "id"]
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS forecast_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            as_of_date      TEXT NOT NULL,   -- базовая дата прогноза (последний торговый день)
-            created_at      TEXT,            -- когда запись внесена
-            model           TEXT NOT NULL,   -- GBM / ARIMA / XGBoost / MLP / Ensemble
-            horizon_key     TEXT,            -- h_3d / h_10d / h_1m / h_3m / h_6m
-            horizon_label   TEXT,            -- «3 дня» …
-            horizon_days    INTEGER NOT NULL,-- 3 / 10 / 21 / 63 / 126 (торговые дни)
-            target_date     TEXT,            -- ожидаемая календарная дата исполнения
-            p0              REAL,            -- цена на базовую дату, USD/lb
-            point           REAL,            -- точечный прогноз, USD/lb
-            median          REAL,
-            p10             REAL,
-            p25             REAL,
-            p75             REAL,
-            p90             REAL,
-            change_pct      REAL,            -- ожидаемое изменение к p0, %
-            prob_up         REAL,            -- P(рост), %
-            sigma_t         REAL,
-            source          TEXT DEFAULT 'live',  -- live | backfill
-            -- поля сверки (NULL пока факт не наступил)
-            resolved        INTEGER DEFAULT 0,
-            resolved_at     TEXT,
-            actual_date     TEXT,
-            actual_price    REAL,
-            abs_error       REAL,
-            pct_error       REAL,
-            signed_error    REAL,            -- point - actual (>0 = переоценка)
-            direction_correct INTEGER,       -- 1, если знак (рост/падение) угадан
-            in_interval_80  INTEGER,         -- 1, если факт в [p10, p90]
-            UNIQUE(as_of_date, model, horizon_days, source)
-        )
-        """
+        f"INSERT INTO forecast_log ({', '.join(common)}, market) "
+        f"SELECT {', '.join(common)}, 'COMEX' FROM _forecast_log_old"
     )
+    conn.execute("DROP TABLE _forecast_log_old")
+    logger.info("Журнал мигрирован: добавлена колонка market (старые записи → COMEX)")
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """Создать таблицу/индексы; при необходимости мигрировать старую схему."""
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='forecast_log'"
+    ).fetchone()
+    if exists:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(forecast_log)").fetchall()]
+        if "market" not in cols:
+            _migrate_add_market(conn)
+    else:
+        conn.execute(_SCHEMA_SQL)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_resolved ON forecast_log(resolved)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_model_h ON forecast_log(model, horizon_days)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_asof ON forecast_log(as_of_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fl_market ON forecast_log(market)")
     conn.commit()
 
 
@@ -159,6 +187,15 @@ def _now_iso() -> str:
     return _dt.datetime.now().isoformat(timespec="seconds")
 
 
+def _pick(r, *names):
+    """Первое доступное значение среди возможных имён колонок.
+    Позволяет принимать и COMEX-таблицу (USD/lb), и LME-таблицу (USD/т)."""
+    for n in names:
+        if n in r and r.get(n) is not None:
+            return r.get(n)
+    return None
+
+
 def _resolution_metrics(p0: float, point: float, p10: float, p90: float,
                         actual: float) -> Dict:
     """Метрики попадания прогноза в факт."""
@@ -182,15 +219,14 @@ def _resolution_metrics(p0: float, point: float, p10: float, p90: float,
 # ---------------------------------------------------------------------------
 
 def log_forecast(df_fc: pd.DataFrame, as_of_date, source: str = "live",
+                 market: str = "COMEX",
                  conn: Optional[sqlite3.Connection] = None) -> int:
     """Записать прогнозы из таблицы forecasts_to_dataframe в журнал.
 
-    Идемпотентно: повторная запись за ту же (дата, модель, горизонт, source)
-    игнорируется (INSERT OR IGNORE). Возвращает число фактически добавленных строк.
-
-    df_fc — DataFrame с колонками forecasts_to_dataframe:
-        Горизонт, Дней, Модель, "P0, USD/lb", Точечный, Медиана,
-        p10, p25, p75, p90, "Δ, %", "P(↑), %", σ_T
+    Идемпотентно по (дата, модель, горизонт, source, market) — INSERT OR IGNORE.
+    market: 'COMEX' (цены USD/lb) или 'LME' (цены USD/т). Имена ценовых колонок
+    подбираются гибко (_pick), поэтому подходит и COMEX-, и LME-таблица.
+    Возвращает число фактически добавленных строк.
     """
     own = conn is None
     if own:
@@ -210,10 +246,14 @@ def log_forecast(df_fc: pd.DataFrame, as_of_date, source: str = "live",
             rows.append((
                 as_of_s, created, str(r.get("Модель")),
                 _key_by_days().get(H, ""), str(r.get("Горизонт")), H, target,
-                _f(r.get("P0, USD/lb")), _f(r.get("Точечный")), _f(r.get("Медиана")),
-                _f(r.get("p10")), _f(r.get("p25")), _f(r.get("p75")), _f(r.get("p90")),
+                _f(_pick(r, "P0, USD/lb", "P0, USD/т")),
+                _f(_pick(r, "Точечный", "Точечный, USD/т")),
+                _f(_pick(r, "Медиана", "Медиана, USD/т")),
+                _f(_pick(r, "p10", "p10, USD/т")), _f(_pick(r, "p25", "p25, USD/т")),
+                _f(_pick(r, "p75", "p75, USD/т")), _f(_pick(r, "p90", "p90, USD/т")),
                 _f(r.get("Δ, %")), _f(r.get("P(↑), %")), _f(r.get("σ_T")), source,
                 0, None, None, None, None, None, None, None, None,
+                market,
             ))
         before = _total(conn)
         conn.executemany(
@@ -271,6 +311,7 @@ def log_walkforward(predictions: Dict[str, Dict[int, pd.DataFrame]],
                         1, created, (as_of + Hi * bday).strftime("%Y-%m-%d"), actual,
                         m["abs_error"], m["pct_error"], m["signed_error"],
                         m["direction_correct"], m["in_interval_80"],
+                        "COMEX",
                     ))
         before = _total(conn)
         conn.executemany(
@@ -289,11 +330,12 @@ def log_walkforward(predictions: Dict[str, Dict[int, pd.DataFrame]],
 #  Сверка с фактом
 # ---------------------------------------------------------------------------
 
-def resolve_due(price_series: pd.Series,
+def resolve_due(price_series: pd.Series, market: str = "COMEX",
                 conn: Optional[sqlite3.Connection] = None) -> int:
-    """Разрешить все прогнозы, для которых уже наступила целевая дата.
+    """Разрешить прогнозы данного рынка, для которых наступила целевая дата.
 
-    price_series — актуальный ряд цен меди (raw["copper"]) с DatetimeIndex.
+    price_series — актуальный ряд цен соответствующего рынка с DatetimeIndex
+    (COMEX → raw["copper"] USD/lb; LME → raw["lme_3m"] USD/т).
     Факт берётся позиционным сдвигом: позиция базовой даты + H торговых дней.
     Возвращает число разрешённых на этом проходе прогнозов.
     """
@@ -307,7 +349,8 @@ def resolve_due(price_series: pd.Series,
         idx = ps.index
         cur = conn.execute(
             "SELECT id, as_of_date, horizon_days, p0, point, p10, p90 "
-            "FROM forecast_log WHERE resolved = 0"
+            "FROM forecast_log WHERE resolved = 0 AND market = ?",
+            (market,),
         )
         pending = cur.fetchall()
         resolved_at = _now_iso()
@@ -348,11 +391,12 @@ def resolve_due(price_series: pd.Series,
 
 def accuracy_summary(conn: Optional[sqlite3.Connection] = None,
                      model: Optional[str] = None,
-                     source: Optional[str] = None) -> pd.DataFrame:
+                     source: Optional[str] = None,
+                     market: Optional[str] = None) -> pd.DataFrame:
     """Сводка точности по (модель × горизонт) на разрешённых прогнозах.
 
-    Колонки: model, horizon_days, horizon_label, n, hit_rate (%),
-    coverage80 (%), mae (USD/lb), mape (%), bias (USD/lb, signed).
+    market: 'COMEX' / 'LME' / None (все). Колонки: model, horizon_days,
+    horizon_label, n, hit_rate (%), coverage80 (%), mae, mape (%), bias.
     """
     own = conn is None
     if own:
@@ -366,6 +410,9 @@ def accuracy_summary(conn: Optional[sqlite3.Connection] = None,
         if source:
             where.append("source = ?")
             params.append(source)
+        if market:
+            where.append("market = ?")
+            params.append(market)
         q = f"SELECT * FROM forecast_log WHERE {' AND '.join(where)}"
         df = pd.read_sql_query(q, conn, params=params)
         if df.empty:
@@ -394,6 +441,7 @@ def load_log(conn: Optional[sqlite3.Connection] = None,
              model: Optional[str] = None,
              horizon_days: Optional[int] = None,
              source: Optional[str] = None,
+             market: Optional[str] = None,
              limit: Optional[int] = None) -> pd.DataFrame:
     """Выгрузить журнал в DataFrame (для таблиц/графиков в UI)."""
     own = conn is None
@@ -413,6 +461,9 @@ def load_log(conn: Optional[sqlite3.Connection] = None,
         if source:
             where.append("source = ?")
             params.append(source)
+        if market:
+            where.append("market = ?")
+            params.append(market)
         q = "SELECT * FROM forecast_log"
         if where:
             q += " WHERE " + " AND ".join(where)
@@ -481,16 +532,27 @@ def clear(conn: Optional[sqlite3.Connection] = None,
 # ---------------------------------------------------------------------------
 
 def record_live_forecast(df_fc: pd.DataFrame, as_of_date, price_series: pd.Series,
-                         path: Optional[Path] = None) -> Dict[str, int]:
-    """Один вызов из app.py: записать текущий прогноз и разрешить наступившие.
+                         path: Optional[Path] = None,
+                         lme_df: Optional[pd.DataFrame] = None,
+                         lme_series: Optional[pd.Series] = None) -> Dict[str, int]:
+    """Один вызов из app.py: записать текущий прогноз(ы) и разрешить наступившие.
 
-    Безопасно вызывать на каждый рендер — запись идемпотентна. Возвращает
-    {"logged": сколько новых записано, "resolved": сколько разрешено}.
+    COMEX-прогноз (df_fc) пишется с market='COMEX' и резолвится по price_series
+    (raw["copper"], USD/lb). Если переданы lme_df (forecast_lme_direct) и
+    lme_series (raw["lme_3m"], USD/т) — дополнительно пишется LME-прогноз
+    (market='LME') с резолвом по lme_series. Запись идемпотентна.
     """
     conn = connect(path)
     try:
-        logged = log_forecast(df_fc, as_of_date, source="live", conn=conn)
-        resolved = resolve_due(price_series, conn=conn)
+        logged = log_forecast(df_fc, as_of_date, source="live",
+                              market="COMEX", conn=conn)
+        resolved = resolve_due(price_series, market="COMEX", conn=conn)
+        if lme_df is not None and not lme_df.empty and lme_series is not None:
+            ls = lme_series.dropna()
+            if len(ls):
+                logged += log_forecast(lme_df, ls.index[-1], source="live",
+                                       market="LME", conn=conn)
+                resolved += resolve_due(ls, market="LME", conn=conn)
         return {"logged": logged, "resolved": resolved}
     finally:
         conn.close()

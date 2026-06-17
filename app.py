@@ -388,10 +388,19 @@ else:
 #  Запись идемпотентна (1 строка на дату×модель×горизонт), сбой журнала
 #  не должен ломать приложение — оборачиваем в try/except.
 # ============================================================
+# LME-прогноз (Этап 1/3) — вычисляем один раз, переиспользуется во вкладке LME
+# и в журнале. Сейчас это GBM (дёшево); когда дозреет ML, стоит обернуть в кэш.
+try:
+    lme_direct_df, lme_direct_models = lf.forecast_lme_direct(raw)
+except Exception:
+    lme_direct_df, lme_direct_models = pd.DataFrame(), []
+
 if not historical_mode:
     try:
         _jr = history_db.record_live_forecast(
-            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"]
+            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"],
+            lme_df=(lme_direct_df if not lme_direct_df.empty else None),
+            lme_series=(raw["lme_3m"] if "lme_3m" in raw.columns else None),
         )
         if _jr.get("logged") or _jr.get("resolved"):
             logging.info("Журнал прогнозов: +%d записано, %d сверено с фактом",
@@ -2293,10 +2302,20 @@ with tab_accuracy:
                 "наполните его из back-test в блоке выше."
             )
         else:
-            _log_all = history_db.load_log(resolved_only=True)
-            models_avail = sorted(_log_all["model"].dropna().unique().tolist())
+            _mkt = st.radio("Рынок", ["COMEX", "LME"], horizontal=True,
+                            key="acc_market",
+                            help="COMEX (HG=F, USD/lb) или LME 3M (USD/т). Метрики "
+                                 "LME копятся по мере дозревания LME-модели.")
+            _to_t = 1.0 if _mkt == "LME" else LB_PER_TON   # перевод цены в USD/т
+            _log_all = history_db.load_log(resolved_only=True, market=_mkt)
+            models_avail = (sorted(_log_all["model"].dropna().unique().tolist())
+                            if not _log_all.empty else [])
             default_model = ("Ensemble" if "Ensemble" in models_avail
                              else (models_avail[0] if models_avail else None))
+            if not models_avail:
+                st.info(f"По рынку **{_mkt}** пока нет сверенных с фактом прогнозов. "
+                        "Для LME метрики появятся по мере накопления истории и "
+                        "наступления целевых дат.")
 
             sub_summary, sub_vs, sub_log = st.tabs(
                 ["📊 Сводка по горизонтам", "📈 Прогноз vs факт", "📒 Журнал"]
@@ -2304,13 +2323,13 @@ with tab_accuracy:
 
             # ===== Сводка по горизонтам =====
             with sub_summary:
-                summ = history_db.accuracy_summary()
+                summ = history_db.accuracy_summary(market=_mkt)
                 if summ.empty:
                     st.info("Недостаточно данных для сводки.")
                 else:
                     disp = summ.copy()
-                    disp["MAE, USD/т"] = (disp["mae"] * LB_PER_TON).round(0)
-                    disp["Bias, USD/т"] = (disp["bias"] * LB_PER_TON).round(0)
+                    disp["MAE, USD/т"] = (disp["mae"] * _to_t).round(0)
+                    disp["Bias, USD/т"] = (disp["bias"] * _to_t).round(0)
                     disp = disp.rename(columns={
                         "model": "Модель", "horizon_label": "Горизонт", "n": "N",
                         "hit_rate": "Hit Rate, %", "coverage80": "Coverage80, %",
@@ -2338,7 +2357,7 @@ with tab_accuracy:
                                       annotation_text="50% (случайность)")
                         fig.update_layout(
                             barmode="group", height=380,
-                            title=f"Попадание по горизонтам — {msel}",
+                            title=f"Попадание по горизонтам — {_mkt} · {msel}",
                             yaxis_title="%", margin=dict(l=10, r=10, t=50, b=10),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02,
                                         xanchor="right", x=1))
@@ -2353,48 +2372,54 @@ with tab_accuracy:
 
             # ===== Прогноз vs факт =====
             with sub_vs:
-                cvs1, cvs2 = st.columns([1, 1])
-                with cvs1:
-                    m_vs = st.selectbox(
-                        "Модель", models_avail, key="vs_model",
-                        index=(models_avail.index(default_model)
-                               if default_model in models_avail else 0))
-                with cvs2:
-                    h_pick = st.selectbox("Горизонт", [h["label"] for h in HORIZONS],
-                                          key="vs_horizon")
-                h_days_pick = next(h["days"] for h in HORIZONS if h["label"] == h_pick)
-                d = history_db.load_log(resolved_only=True, model=m_vs,
-                                        horizon_days=h_days_pick)
-                if d.empty:
-                    st.info("Нет сверенных прогнозов для этой комбинации.")
+                if not models_avail:
+                    st.info(f"Нет сверенных прогнозов по рынку {_mkt}.")
                 else:
-                    d = d.sort_values("actual_date")
-                    ad = pd.to_datetime(d["actual_date"])
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=ad, y=d["p90"] * LB_PER_TON, mode="lines",
-                        line=dict(width=0), showlegend=False, hoverinfo="skip"))
-                    fig.add_trace(go.Scatter(
-                        x=ad, y=d["p10"] * LB_PER_TON, mode="lines", fill="tonexty",
-                        fillcolor="rgba(224,6,19,0.12)", line=dict(width=0),
-                        name="Коридор p10-p90"))
-                    fig.add_trace(go.Scatter(
-                        x=ad, y=d["point"] * LB_PER_TON, mode="lines+markers",
-                        line=dict(color="#E00613", dash="dot"), name="Прогноз"))
-                    fig.add_trace(go.Scatter(
-                        x=ad, y=d["actual_price"] * LB_PER_TON, mode="lines+markers",
-                        line=dict(color="#001829"), name="Факт"))
-                    fig.update_layout(
-                        height=420, title=f"{m_vs} · {h_pick}: прогноз vs факт",
-                        xaxis_title="Дата исполнения", yaxis_title="Цена меди, USD/т",
-                        margin=dict(l=10, r=10, t=50, b=10),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                                    xanchor="right", x=1))
-                    st.plotly_chart(fig, use_container_width=True)
-                    mm1, mm2, mm3 = st.columns(3)
-                    mm1.metric("Hit Rate", f"{d['direction_correct'].mean() * 100:.0f}%")
-                    mm2.metric("Coverage80", f"{d['in_interval_80'].mean() * 100:.0f}%")
-                    mm3.metric("MAPE", f"{d['pct_error'].mean():.2f}%")
+                    cvs1, cvs2 = st.columns([1, 1])
+                    with cvs1:
+                        m_vs = st.selectbox(
+                            "Модель", models_avail, key="vs_model",
+                            index=(models_avail.index(default_model)
+                                   if default_model in models_avail else 0))
+                    with cvs2:
+                        h_pick = st.selectbox("Горизонт",
+                                              [h["label"] for h in HORIZONS],
+                                              key="vs_horizon")
+                    h_days_pick = next(h["days"] for h in HORIZONS
+                                       if h["label"] == h_pick)
+                    d = history_db.load_log(resolved_only=True, model=m_vs,
+                                            horizon_days=h_days_pick, market=_mkt)
+                    if d.empty:
+                        st.info("Нет сверенных прогнозов для этой комбинации.")
+                    else:
+                        d = d.sort_values("actual_date")
+                        ad = pd.to_datetime(d["actual_date"])
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=ad, y=d["p90"] * _to_t, mode="lines",
+                            line=dict(width=0), showlegend=False, hoverinfo="skip"))
+                        fig.add_trace(go.Scatter(
+                            x=ad, y=d["p10"] * _to_t, mode="lines", fill="tonexty",
+                            fillcolor="rgba(224,6,19,0.12)", line=dict(width=0),
+                            name="Коридор p10-p90"))
+                        fig.add_trace(go.Scatter(
+                            x=ad, y=d["point"] * _to_t, mode="lines+markers",
+                            line=dict(color="#E00613", dash="dot"), name="Прогноз"))
+                        fig.add_trace(go.Scatter(
+                            x=ad, y=d["actual_price"] * _to_t, mode="lines+markers",
+                            line=dict(color="#001829"), name="Факт"))
+                        fig.update_layout(
+                            height=420,
+                            title=f"{_mkt} · {m_vs} · {h_pick}: прогноз vs факт",
+                            xaxis_title="Дата исполнения", yaxis_title="Цена меди, USD/т",
+                            margin=dict(l=10, r=10, t=50, b=10),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                        xanchor="right", x=1))
+                        st.plotly_chart(fig, use_container_width=True)
+                        mm1, mm2, mm3 = st.columns(3)
+                        mm1.metric("Hit Rate", f"{d['direction_correct'].mean()*100:.0f}%")
+                        mm2.metric("Coverage80", f"{d['in_interval_80'].mean()*100:.0f}%")
+                        mm3.metric("MAPE", f"{d['pct_error'].mean():.2f}%")
 
             # ===== Журнал =====
             with sub_log:
@@ -2412,7 +2437,7 @@ with tab_accuracy:
                 hd_arg = (None if flt_h == "(все)"
                           else next(h["days"] for h in HORIZONS if h["label"] == flt_h))
                 dlog = history_db.load_log(resolved_only=only_res, model=m_arg,
-                                           horizon_days=hd_arg, limit=2000)
+                                           horizon_days=hd_arg, market=_mkt, limit=2000)
                 if dlog.empty:
                     st.info("Журнал пуст для выбранных фильтров.")
                 else:
@@ -2420,8 +2445,8 @@ with tab_accuracy:
                         "База": dlog["as_of_date"],
                         "Гориз.": dlog["horizon_label"],
                         "Модель": dlog["model"],
-                        "Прогноз, USD/т": (dlog["point"] * LB_PER_TON).round(0),
-                        "Факт, USD/т": (dlog["actual_price"] * LB_PER_TON).round(0),
+                        "Прогноз, USD/т": (dlog["point"] * _to_t).round(0),
+                        "Факт, USD/т": (dlog["actual_price"] * _to_t).round(0),
                         "Напр.": dlog["direction_correct"].map({1: "✅", 0: "❌"}),
                         "В коридоре": dlog["in_interval_80"].map({1: "✅", 0: "❌"}),
                         "Ошибка, %": dlog["pct_error"].round(2),
@@ -2431,7 +2456,7 @@ with tab_accuracy:
                     st.download_button(
                         "📥 Скачать журнал CSV",
                         data=dlog.to_csv(index=False).encode("utf-8"),
-                        file_name="forecast_history.csv", mime="text/csv",
+                        file_name=f"forecast_history_{_mkt}.csv", mime="text/csv",
                     )
 
 
@@ -2483,7 +2508,7 @@ with tab_lme:
 
         # 2) Прямой прогноз на ряду LME 3M (авто-дозревание моделей)
         st.markdown("### 📐 Прямой прогноз на ряду LME 3M (авто-дозревание)")
-        _lme_df, _lme_models = lf.forecast_lme_direct(raw)
+        _lme_df, _lme_models = lme_direct_df, lme_direct_models
         if _lme_df.empty:
             st.info(f"Недостаточно данных LME для прямого прогноза "
                     f"(нужно ≥{lf.GBM_MIN_DAYS} дн., есть {_lst['n_days']}).")
