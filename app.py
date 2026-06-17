@@ -764,8 +764,41 @@ with tab_fc:
         })
     if rows:
         ens_df = pd.DataFrame(rows)
-        st.markdown("**🎯 Сводный ансамбль (с вашими весами)**")
+        st.markdown("**🎯 Сводный ансамбль COMEX (с вашими весами)**")
         st.dataframe(ens_df, use_container_width=True, hide_index=True)
+
+        # === LME 3M — основная информация (глобальный бенчмарк) ===
+        st.markdown("**🌍 Тот же прогноз в LME 3M** "
+                    "_(глобальный бенчмарк; COMEX искажён тарифами США 2025)_")
+        _prem_main = lf.current_premium_pct(raw)
+        if _prem_main is not None:
+            try:
+                _ens_comex = df_fc[df_fc["Модель"] == "Ensemble"]
+                _lme_main = lf.comex_to_lme_df(_ens_comex, _prem_main)
+                _lme_cols = [c for c in ["Горизонт", "p10, USD/т", "Точечный, USD/т",
+                                         "p90, USD/т", "Δ, %", "P(↑), %"]
+                             if c in _lme_main.columns]
+                st.dataframe(_lme_main[_lme_cols], use_container_width=True,
+                             hide_index=True)
+                st.caption(f"Пересчёт из COMEX-ансамбля по текущей премии "
+                           f"COMEX–LME ({_prem_main:+.1f}%). Прямой прогноз на LME "
+                           f"и детали — во вкладке «🌍 LME (β)».")
+            except Exception:
+                st.caption("Премия COMEX–LME временно недоступна.")
+        else:
+            st.caption("Данные LME пока недоступны.")
+
+        # Статус дозревания собственной LME-модели
+        _lst_main = lf.data_status(raw)
+        if _lst_main["n_days"] > 0:
+            _mat = [("GBM ✅" if _lst_main["gbm_ok"] else "GBM ⏳"),
+                    ("ARIMA ✅" if _lst_main["arima_ok"]
+                     else f"ARIMA — через ~{max(0, lf.ARIMA_MIN_DAYS - _lst_main['n_days'])} дн."),
+                    ("ML ✅" if _lst_main["ml_ok"]
+                     else f"ML (XGBoost/нейросеть) — через ~{_lst_main['ml_eta_days']} дн.")]
+            st.info(f"📈 Собственная LME-модель дозревает (накоплено "
+                    f"{_lst_main['n_days']} дн. истории LME): " + " · ".join(_mat) +
+                    ". Дополнительные модели подключатся автоматически, без обновлений.")
 
         # === PDF + стресс-тесты + прогнозы инвестбанков ===
         col_pdf, col_stress = st.columns([1, 2])
