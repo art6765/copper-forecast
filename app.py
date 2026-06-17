@@ -493,11 +493,25 @@ def _conf_light(conf: int, color: str) -> str:
 
 def render_buyer():
     spot_lb = float(raw["copper"].iloc[-1])
-    spot_t = spot_lb * LB_PER_TON
+    spot_t_comex = spot_lb * LB_PER_TON
     calm = _regime_calm_prob()
 
+    # Основной ориентир — LME 3M (глобальный бенчмарк). COMEX — справочно.
+    _prem = lf.current_premium_pct(raw)
+    _has_lme = (_prem is not None and "lme_3m" in raw.columns
+                and raw["lme_3m"].notna().any())
+    _factor = 1.0 / (1.0 + _prem / 100.0) if _has_lme else 1.0
+    spot_t = float(raw["lme_3m"].dropna().iloc[-1]) if _has_lme else spot_t_comex
+    _unit = "LME 3M" if _has_lme else "COMEX HG=F"
+
     st.markdown(f"## Покупать или подождать?")
-    st.caption(f"Медь · COMEX HG=F · спот **{spot_t:,.0f} USD/т** · данные на {raw.index.max().date()}")
+    if _has_lme:
+        st.caption(f"Медь · **{_unit}** · спот **{spot_t:,.0f} USD/т** · "
+                   f"данные на {raw.index.max().date()} "
+                   f"_(COMEX справочно: {spot_t_comex:,.0f} USD/т, премия {_prem:+.1f}%)_")
+    else:
+        st.caption(f"Медь · {_unit} · спот **{spot_t:,.0f} USD/т** · "
+                   f"данные на {raw.index.max().date()}")
 
     # --- Селектор горизонта ---
     # compute_verdict ждёт {hk: {model_name: HorizonForecast}}.
@@ -525,6 +539,10 @@ def render_buyer():
         horizontal=True, index=hz_avail.index("h_1m") if "h_1m" in hz_avail else 0,
     )
     v = verdicts[chosen]
+    # Цены в LME-эквиваленте (через премию); при отсутствии LME = COMEX
+    med = v.median_usd_t * _factor
+    p10 = v.p10_usd_t * _factor
+    p90 = v.p90_usd_t * _factor
 
     # --- Карточка вердикта ---
     tone_bg = {"ok": "rgba(25,135,84,.12)", "warn": "rgba(245,158,11,.14)",
@@ -538,8 +556,8 @@ def render_buyer():
   <div class='rail' style='background:{v.color}'></div>
   <div style='padding-left:14px'>
     <div class='verdict-eyebrow'>Цель на {v.horizon_label.lower()} · {sub_label}</div>
-    <div class='verdict-price'>{v.median_usd_t:,.0f}<span class='u'> /т</span></div>
-    <div class='verdict-rub'>p10–p90: {v.p10_usd_t:,.0f} – {v.p90_usd_t:,.0f} USD/т</div>
+    <div class='verdict-price'>{med:,.0f}<span class='u'> /т</span></div>
+    <div class='verdict-rub'>p10–p90: {p10:,.0f} – {p90:,.0f} USD/т</div>
     <div class='verdict-tag' style='background:{tone_bg};color:{v.color}'>
       <span style='font-size:24px'>{v.icon}</span> {v.label}
       <span style='font-weight:600;color:#7F8B93'>· {v.ru}</span>
@@ -556,10 +574,10 @@ def render_buyer():
 
     # --- Метрики сравнения ---
     m1, m2, m3 = st.columns(3)
-    m1.metric("Текущий спот", f"{spot_t:,.0f} USD/т")
-    m2.metric("Прогноз к сроку", f"{v.median_usd_t:,.0f} USD/т",
+    m1.metric(f"Текущий спот ({_unit})", f"{spot_t:,.0f} USD/т")
+    m2.metric("Прогноз к сроку", f"{med:,.0f} USD/т",
               f"{v.change_pct:+.1f}%")
-    band = (v.p90_usd_t - v.p10_usd_t) / 2 / v.median_usd_t * 100
+    band = (p90 - p10) / 2 / med * 100
     m3.metric("Размах коридора 80%", f"±{band:.1f}%")
 
     # --- Почему такой совет ---
@@ -582,11 +600,11 @@ def render_buyer():
         # Горизонтальная полоса коридора через plotly
         fig_b = go.Figure()
         fig_b.add_trace(go.Scatter(
-            x=[v.p10_usd_t, v.p90_usd_t], y=[0, 0], mode="lines",
+            x=[p10, p90], y=[0, 0], mode="lines",
             line=dict(color=v.color, width=18), opacity=0.25, showlegend=False,
             hoverinfo="skip"))
         fig_b.add_trace(go.Scatter(
-            x=[v.median_usd_t], y=[0], mode="markers",
+            x=[med], y=[0], mode="markers",
             marker=dict(color=v.color, size=20, line=dict(color="white", width=2)),
             showlegend=False,
             hovertemplate="Прогноз: %{x:,.0f} USD/т<extra></extra>"))
