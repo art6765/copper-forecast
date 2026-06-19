@@ -892,18 +892,43 @@ with tab_fc:
                 )
 
     # График: история + веер прогнозов
-    st.markdown("**График прогноза**")
+    # --- Шкала графика: LME 3M (основной ориентир) в обычном режиме;
+    #     COMEX HG — в историческом бэктесте (LME-история есть только с 2026). ---
+    _g_prem = lf.current_premium_pct(raw)
+    _g_has_lme = (_g_prem is not None and "lme_3m" in raw.columns
+                  and raw["lme_3m"].notna().any())
+    lme_factor = 1.0 / (1.0 + _g_prem / 100.0) if _g_has_lme else 1.0
+    use_lme = (not historical_mode) and _g_has_lme
+    # Множитель перевода COMEX-прогноза (USD/lb) в отображаемую цену (USD/т):
+    # в LME-режиме делим на премию COMEX→LME, иначе — обычный COMEX в USD/т.
+    fc_factor = LB_PER_TON * (lme_factor if use_lme else 1.0)
+    unit_name = "LME 3M" if use_lme else "COMEX HG"
+
+    if use_lme:
+        st.markdown("**График прогноза — LME 3M** "
+                    "_(глобальный бенчмарк: чёрная линия — биржевой LME 3M, "
+                    "веер — прогноз в LME через премию COMEX→LME)_")
+    else:
+        st.markdown("**График прогноза**")
 
     # В историческом режиме базовая точка — это as_of_date, не сегодня
-    if historical_mode and historical_as_of is not None:
+    if use_lme:
+        # Реальный накопленный ряд LME 3M (Westmetall), уже в USD/т
+        hist_full = raw["lme_3m"].dropna()
+        base_d = hist_full.index.max()
+        idx_base = len(hist_full) - 1
+        hist_scale = 1.0
+    elif historical_mode and historical_as_of is not None:
         # Серия истории — до as_of_date; будущее (факт) — после
         base_d = historical_as_of
         hist_full = raw["copper"]
         idx_base = hist_full.index.get_loc(base_d) if base_d in hist_full.index else len(hist_full) - 1
+        hist_scale = LB_PER_TON
     else:
         base_d = raw.index.max()
         hist_full = raw["copper"]
         idx_base = len(hist_full) - 1
+        hist_scale = LB_PER_TON
 
     hist_days = st.slider("Показать дней истории до точки прогноза", 30, 750, 252, step=30)
     # История до базовой точки
@@ -938,8 +963,9 @@ with tab_fc:
 
     # 1) История до базовой точки
     fig.add_trace(go.Scatter(
-        x=hist.index, y=hist.values * LB_PER_TON,
-        mode="lines", name="История (известная модели)",
+        x=hist.index, y=hist.values * hist_scale,
+        mode="lines",
+        name="LME 3M (биржевой факт)" if use_lme else "История (известная модели)",
         line=dict(color="black", width=1.5),
     ))
 
@@ -951,7 +977,7 @@ with tab_fc:
         future = hist_full.iloc[idx_base : right_end + 1]
         if len(future) > 1:
             fig.add_trace(go.Scatter(
-                x=future.index, y=future.values * LB_PER_TON,
+                x=future.index, y=future.values * hist_scale,
                 mode="lines", name="ФАКТ (что было после)",
                 line=dict(color="#2ca02c", width=2, dash="dash"),
             ))
@@ -976,28 +1002,28 @@ with tab_fc:
         col = color_map.get(selected_model, "#666666")
         # Веер: p10-p90 как прямоугольник
         fig.add_trace(go.Scatter(
-            x=[future_d, future_d], y=[f.p10 * LB_PER_TON, f.p90 * LB_PER_TON],
+            x=[future_d, future_d], y=[f.p10 * fc_factor, f.p90 * fc_factor],
             mode="lines", line=dict(color=col, width=10), opacity=0.25,
             showlegend=False, hoverinfo="skip",
         ))
         # p25-p75 — более плотный
         fig.add_trace(go.Scatter(
-            x=[future_d, future_d], y=[f.p25 * LB_PER_TON, f.p75 * LB_PER_TON],
+            x=[future_d, future_d], y=[f.p25 * fc_factor, f.p75 * fc_factor],
             mode="lines", line=dict(color=col, width=10), opacity=0.55,
             showlegend=False, hoverinfo="skip",
         ))
         # Точечный
         fig.add_trace(go.Scatter(
-            x=[future_d], y=[f.point * LB_PER_TON],
+            x=[future_d], y=[f.point * fc_factor],
             mode="markers+text", marker=dict(color=col, size=11),
-            text=[f"{f.label}<br>{f.point * LB_PER_TON:,.0f}<br>({f.change_pct:+.1f}%)"],
+            text=[f"{f.label}<br>{f.point * fc_factor:,.0f}<br>({f.change_pct:+.1f}%)"],
             textposition="middle right",
             name=f"{selected_model} {f.label}",
             showlegend=False,
         ))
 
     # Горизонтальная линия P0 (точка прогноза)
-    p0_for_plot = float(hist_full.iloc[idx_base]) * LB_PER_TON
+    p0_for_plot = float(hist_full.iloc[idx_base]) * hist_scale
     # Горизонтальная линия P0
     fig.add_hline(y=p0_for_plot, line=dict(color="gray", dash="dash", width=1),
                   annotation_text=f"P0 = {p0_for_plot:,.0f}", annotation_position="bottom right")
@@ -1052,7 +1078,7 @@ with tab_fc:
         height=560, hovermode="x unified",
         xaxis_title="Дата", yaxis_title="USD/t",
         margin=dict(l=10, r=10, t=30, b=10),
-        title=f"Прогноз ({selected_model}). Веер: тёмный = p25-p75, светлый = p10-p90"
+        title=f"Прогноз {unit_name} ({selected_model}). Веер: тёмный = p25-p75, светлый = p10-p90"
               + (" · Историческая дата прогноза" if historical_mode else ""),
     )
     st.plotly_chart(fig, use_container_width=True)
