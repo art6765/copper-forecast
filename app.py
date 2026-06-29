@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import pickle
+from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
@@ -58,16 +60,50 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 #  Кэширование тяжёлых операций
 # ============================================================
 
-@st.cache_data(ttl=3600, show_spinner="Загружаю рыночные данные…")
+# Персистентный диск-кэш тяжёлых результатов (прогнозов). st.cache_data держит
+# результат только в памяти процесса и теряет его при перезапуске сервиса или
+# нехватке памяти — на слабом VPS это приводит к переобучению на каждый заход.
+# Диск-кэш переживает перезапуски: обучение происходит максимум раз в день,
+# когда меняется сигнатура (приходят новые данные).
+_STATE_DIR = Path(__file__).resolve().parent / "data"
+
+
+def _disk_load(name: str, sig: str):
+    """Загрузить ранее обученный результат с диска, если сигнатура совпадает."""
+    try:
+        p = _STATE_DIR / f"state_{name}.pkl"
+        if p.exists():
+            obj = pickle.loads(p.read_bytes())
+            if obj.get("sig") == sig:
+                return obj["payload"]
+    except Exception:
+        pass
+    return None
+
+
+def _disk_save(name: str, sig: str, payload) -> None:
+    try:
+        _STATE_DIR.mkdir(exist_ok=True)
+        (_STATE_DIR / f"state_{name}.pkl").write_bytes(
+            pickle.dumps({"sig": sig, "payload": payload}))
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=86400, show_spinner="Загружаю рыночные данные…")
 def cached_load(years: int, refresh: bool = False) -> pd.DataFrame:
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     return load_all(start=start, refresh=refresh)
 
 
-@st.cache_data(ttl=3600, show_spinner="Обучаю модели…")
+@st.cache_data(ttl=86400, show_spinner="Обучаю модели…")
 def cached_forecast(_raw_signature: str, years: int,
                     use_xgb: bool, use_mlp: bool, use_arima: bool, use_gbm: bool):
-    """raw_signature — служебная строка для invalidate кэша при изменении входов."""
+    """raw_signature — служебная строка для invalidate кэша при изменении входов.
+    Результат дополнительно кэшируется на диск, чтобы переживать перезапуск."""
+    disk = _disk_load("forecast", _raw_signature)
+    if disk is not None:
+        return disk
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
     xgb_models, xgb_x_now = {}, {}
@@ -85,16 +121,24 @@ def cached_forecast(_raw_signature: str, years: int,
                 explanations[hk] = {"df": contrib_df, "meta": meta}
             except Exception:
                 pass
-    return raw, results, df, explanations
+    payload = (raw, results, df, explanations)
+    _disk_save("forecast", _raw_signature, payload)
+    return payload
 
 
-@st.cache_data(ttl=3600, show_spinner="Прогнозирую курс доллара…")
+@st.cache_data(ttl=86400, show_spinner="Прогнозирую курс доллара…")
 def cached_usdrub_forecast(_raw_signature: str, years: int):
-    """Прогноз курса доллара ЦБ РФ (USD/RUB) тем же движком, что и медь.
-    Возвращает {horizon_key: {model_name: HorizonForecast}} в рублях за доллар."""
+    """Прогноз курса доллара ЦБ РФ (USD/RUB). Облегчён до GBM+ARIMA — для валюты
+    тяжёлые ML-модели (XGBoost/MLP) мало что дают, а старт сильно замедляют.
+    Результат кэшируется на диск, чтобы переживать перезапуск сервиса."""
+    disk = _disk_load("usdrub", _raw_signature)
+    if disk is not None:
+        return disk
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
-    return uf.forecast_usdrub(raw)
+    payload = uf.forecast_usdrub(raw, use_xgb=False, use_mlp=False)
+    _disk_save("usdrub", _raw_signature, payload)
+    return payload
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -106,7 +150,7 @@ def cached_accuracy(_sig: str, market: str = "COMEX"):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600, show_spinner="Идентифицирую режимы…")
+@st.cache_data(ttl=86400, show_spinner="Идентифицирую режимы…")
 def cached_regimes(_raw_signature: str, k_regimes: int = 2):
     from regimes import fit_markov_regimes
     start_date = dt.date.today() - dt.timedelta(days=5 * 365 + 30)
@@ -142,7 +186,7 @@ def cached_news():
     return fetch_all_news(max_per_query=30, cache_ttl_min=60)
 
 
-@st.cache_data(ttl=3600, show_spinner="Анализирую сезонность…")
+@st.cache_data(ttl=86400, show_spinner="Анализирую сезонность…")
 def cached_seasonality(_raw_signature: str, years: int):
     """Считает сезонные метрики на копии цен меди."""
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
