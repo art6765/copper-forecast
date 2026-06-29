@@ -207,6 +207,24 @@ def main(argv=None):
     except Exception as exc:
         logger.warning("Журнал прогнозов недоступен: %s", exc)
 
+    # ---- 2c. Telegram-алерт при смене сигнала (если настроен) ----
+    try:
+        import alerts
+        import buyer_logic
+        if alerts.is_configured():
+            spot_lb = float(raw["copper"].iloc[-1])
+            verds = buyer_logic.all_verdicts(results, spot_lb)
+            av = verds.get("h_1m") or next(iter(verds.values()), None)
+            if av:
+                alloc = buyer_logic.recommend_allocation(
+                    av.key, "", av.confidence, av.change_pct)
+                if alerts.check_and_alert(av.key, av.label, av.horizon_label,
+                                          av.median_usd_t, av.change_pct,
+                                          alloc["immediate_pct"]):
+                    logger.info("Telegram-алерт отправлен (смена сигнала)")
+    except Exception as exc:
+        logger.warning("Алерт не отправлен: %s", exc)
+
     # ---- 3. Графики ----
     try:
         _plot_forecasts(raw, df_fc, OUT_DIR / "plots" / "forecast.png", "Ensemble")

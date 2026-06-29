@@ -217,6 +217,70 @@ def buyer_factors(raw_df: pd.DataFrame) -> List[Dict]:
     return factors
 
 
+def recommend_allocation(verdict_key: str, regime_label: str = "",
+                         confidence: int = 60,
+                         change_pct: float = 0.0) -> Dict:
+    """Рекомендация по ОБЪЁМУ закупки под текущую ситуацию.
+
+    Принцип асимметрии потерь закупщика: остаться без металла к сроку дороже,
+    чем слегка переплатить. Поэтому доля несимметрична — в дефиците берём много
+    сразу, в профиците/неопределённости держим минимум, но всегда есть якорный
+    объём (нельзя остаться с пустым складом) и всегда дробим на транши (ladder),
+    чтобы усреднить цену входа.
+
+    Возвращает dict: immediate_pct (доля немедленной закупки, % от потребности),
+    tranches (число траншей), floor_pct (якорный минимум), tone, rationale.
+    """
+    rl = (regime_label or "").lower()
+    turbulent = any(k in rl for k in
+                    ["turb", "паник", "correct", "коррек", "vol", "risk-off"])
+    bullish = any(k in rl for k in ["bull", "дефицит", "перегрев"])
+    bearish = any(k in rl for k in ["bear", "профицит", "затовар"])
+
+    # База по вердикту (логика закупщика: цена вверх → берём больше сейчас)
+    base = {"urgent": 80, "buy": 62, "watch": 45, "wait": 35}.get(verdict_key, 45)
+
+    # Поправка на режим рынка
+    if turbulent:
+        base -= 8                       # высокая вола — осторожнее с разовым объёмом
+    if bullish and verdict_key in ("urgent", "buy"):
+        base += 5                       # подтверждённый дефицит — увереннее
+    if bearish and verdict_key in ("wait", "watch"):
+        base -= 5                       # профицит — ближе к минимуму
+
+    # Поправка на уверенность модели (узкий коридор/спокойный режим)
+    base += (confidence - 60) * 0.25    # ≈ +10% при conf 100, −15% при conf 0
+
+    floor_pct = 35                      # якорь: минимум берём всегда
+    immediate = int(round(max(floor_pct, min(88, base)) / 5) * 5)
+
+    # Лесенка: когда не срочно — дробим сильнее (больше усреднения)
+    tranches = 3 if verdict_key in ("urgent", "buy") else 4
+    if turbulent:
+        tranches = min(5, tranches + 1)
+
+    tone = {"urgent": "ok", "buy": "ok", "watch": "warn", "wait": "wait"}.get(
+        verdict_key, "warn")
+
+    if verdict_key == "urgent":
+        rationale = (f"Цена идёт вверх — берём большую часть ({immediate}%) сейчас, "
+                     f"остальное дробим на {tranches} транша от непредвиденного отката.")
+    elif verdict_key == "buy":
+        rationale = (f"Умеренный риск роста — берём {immediate}% сейчас, остальное "
+                     f"лесенкой на {tranches} транша.")
+    elif verdict_key == "wait":
+        rationale = (f"Вероятен откат — держим якорный минимум {immediate}%, "
+                     f"остальное добираем позже {tranches} траншами на снижении.")
+    else:  # watch
+        rationale = (f"Движения нет — берём {immediate}% и спокойно добираем "
+                     f"{tranches} траншами по мере потребности.")
+    if turbulent:
+        rationale += " Рынок турбулентный — дробим сильнее."
+
+    return {"immediate_pct": immediate, "tranches": tranches,
+            "floor_pct": floor_pct, "tone": tone, "rationale": rationale}
+
+
 if __name__ == "__main__":
     import datetime as dt
     from data_loader import load_all

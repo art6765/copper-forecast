@@ -18,6 +18,9 @@ data/cache_*.csv
 data/forecast_history.sqlite
 data/*.sqlite
 
+# Состояние Telegram-алертов (генерируется на сервере)
+data/alert_state.json
+
 # ИИ-брифинги (генерируются на сервере) и секреты (API-ключи)
 data/briefings/
 .env

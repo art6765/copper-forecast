@@ -43,11 +43,13 @@ from upcoming_events import (
 )
 from buyer_logic import (
     compute_verdict, all_verdicts, buyer_factors, VERDICT_META,
+    recommend_allocation,
 )
 import history_db
 import brief
 import lme_forecast as lf
 import usd_forecast as uf
+import carry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -93,6 +95,15 @@ def cached_usdrub_forecast(_raw_signature: str, years: int):
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
     return uf.forecast_usdrub(raw)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_accuracy(_sig: str, market: str = "COMEX"):
+    """Сводка точности ансамбля из журнала прогнозов (для калибровки на виду)."""
+    try:
+        return history_db.accuracy_summary(model="Ensemble", market=market)
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner="Идентифицирую режимы…")
@@ -331,6 +342,14 @@ time_mode = st.sidebar.radio(
     help="«Историческая дата» обучает модели только на данных до выбранной точки "
          "и сравнивает прогноз с фактическим продолжением.",
 )
+
+# --- Реальная цена закупки: премия + логистика поверх биржи (Фаза J) ---
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🏭 Реальная цена закупки")
+user_premium = st.sidebar.number_input(
+    "Ваша премия + логистика, $/т", min_value=0, max_value=2000, value=0, step=10,
+    help="Физическая премия за катод (бренд/регион) + логистика + финансирование "
+         "сверх биржевой цены. 0 — если не знаете: тогда показывается чистая биржа.")
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Источники: Yahoo Finance (HG=F, DXY, WTI, Gold, Silver, S&P500, US10Y), "
@@ -680,6 +699,109 @@ def render_buyer():
     band = (p90 - p10) / 2 / med * 100
     m3.metric("Размах коридора 80%", f"±{band:.1f}%")
 
+    # --- Сколько брать (Фаза H: объём и лесенка) ---
+    # Режим рынка нужен здесь и для ИИ-отчёта ниже — считаем один раз.
+    try:
+        _fit_b, _ = cached_regimes(f"{raw.index.max().date()}_{years}_2", k_regimes=2)
+        regime_label = _fit_b.label_map[_fit_b.current_regime]
+    except Exception:
+        regime_label = "—"
+
+    alloc = recommend_allocation(v.key, regime_label, v.confidence, v.change_pct)
+    _acol = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[alloc["tone"]]
+    st.markdown(f"""
+<div style='background:#F7F8FB;border-left:4px solid {_acol};border-radius:6px;
+            padding:12px 16px;margin:8px 0 4px'>
+  <div style='font-size:12px;color:#7F8B93;text-transform:uppercase;letter-spacing:.06em'>
+    Сколько брать сейчас</div>
+  <div style='display:flex;align-items:baseline;gap:14px;margin-top:4px;flex-wrap:wrap'>
+    <div style='font-size:30px;font-weight:800;color:{_acol};font-family:JetBrains Mono,monospace'>
+      {alloc['immediate_pct']}%</div>
+    <div style='color:#001829'>от потребности · затем <b>{alloc['tranches']}</b>
+      транша лесенкой <span style='color:#7F8B93'>· якорь {alloc['floor_pct']}%</span></div>
+  </div>
+  <div style='font-size:13px;color:#46535B;margin-top:6px'>{alloc['rationale']}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    # --- Из чего складывается рублёвый риск (Фаза G: медь × курс) ---
+    if med_rub and fx_change is not None:
+        r_med = v.change_pct
+        r_fx = fx_change
+        r_rub = ((1 + r_med / 100) * (1 + r_fx / 100) - 1) * 100
+        _rc = "#E00613" if r_rub > 0.3 else "#198754" if r_rub < -0.3 else "#7F8B93"
+        hedge_hint = ""
+        if abs(r_med) >= 0.5 or abs(r_fx) >= 0.5:
+            if abs(r_fx) > abs(r_med) * 1.3:
+                hedge_hint = ("Главный риск — <b>доллар</b>: дешевле захеджировать "
+                              "валюту, чем металл.")
+            elif abs(r_med) > abs(r_fx) * 1.3:
+                hedge_hint = ("Главный риск — <b>цена меди</b>: имеет смысл "
+                              "зафиксировать цену металла.")
+            else:
+                hedge_hint = "Риск делят медь и доллар примерно поровну."
+        st.markdown(f"""
+<div style='font-size:13px;color:#46535B;margin:2px 0 8px;padding:9px 14px;
+            background:#FAFAFC;border:1px solid #EEF0F3;border-radius:6px'>
+  Рублёвая цена к сроку: <b style='color:{_rc}'>{r_rub:+.1f}%</b>
+  &nbsp;=&nbsp; медь <b>{r_med:+.1f}%</b> &nbsp;+&nbsp; доллар <b>{r_fx:+.1f}%</b>
+  {('<br><span style="color:#7F8B93">' + hedge_hint + '</span>') if hedge_hint else ''}
+</div>
+""", unsafe_allow_html=True)
+
+    # --- Сигнал форвардной кривой LME (Фаза I: контанго/бэквордация) ---
+    cs = carry.carry_signal(raw)
+    if cs:
+        _cc = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[cs["tone"]]
+        st.markdown(f"""
+<div style='font-size:13px;margin:2px 0 8px;padding:9px 14px;background:#FAFAFC;
+            border-left:4px solid {_cc};border-radius:6px'>
+  <b>Кривая LME: {cs['state']}</b>
+  <span style='color:#7F8B93'>· спот {cs['cash']:,.0f} vs 3М {cs['m3']:,.0f} USD/т
+  ({cs['spread']:+.0f} USD/т)</span>
+  <br><span style='color:#46535B'>{cs['note']}</span>
+</div>
+""", unsafe_allow_html=True)
+
+    # --- Калибровка модели на этом сроке (Фаза K) ---
+    acc = cached_accuracy(str(raw.index.max().date()))
+    _hd = {h["key"]: h["days"] for h in HORIZONS}.get(chosen)
+    _arow = acc[acc["horizon_days"] == _hd] if (not acc.empty and _hd is not None) else None
+    if _arow is not None and len(_arow):
+        _r = _arow.iloc[0]
+        st.caption(f"📒 Калибровка на этом сроке: за {int(_r['n'])} прошлых прогнозов "
+                   f"факт попадал в коридор **{_r['coverage80']:.0f}%**, направление "
+                   f"угадано **{_r['hit_rate']:.0f}%**.")
+    else:
+        st.caption("📒 Калибровка на этом сроке: статистика накапливается — журнал "
+                   "точности ещё набирает историю.")
+
+    # --- Полная цена закупки с премией (Фаза J) ---
+    if user_premium and user_premium > 0:
+        full_usd = med + user_premium
+        full_rub = full_usd * fx_fore if fx_fore else None
+        rub_part = f" ≈ <b>{full_rub:,.0f} ₽/т</b>" if full_rub else ""
+        st.markdown(f"""
+<div style='font-size:14px;margin:6px 0 8px;padding:10px 14px;background:#FFF8F0;
+            border-left:4px solid #B5651D;border-radius:6px'>
+  <b>Полная цена закупки ≈ {full_usd:,.0f} USD/т</b>{rub_part}
+  <span style='color:#7F8B93'><br>биржа {med:,.0f} + ваша премия/логистика
+  {user_premium:,.0f} USD/т</span>
+</div>
+""", unsafe_allow_html=True)
+
+    # --- Слепые зоны данных (Фаза J: честность про непокрытое) ---
+    with st.expander("🌫️ Слепые зоны: что система НЕ видит"):
+        st.markdown(
+            "- **Китай (~60% мирового спроса)** — в системе только курс юаня. "
+            "Нет премии Яншань, запасов SHFE, импорта меди Китаем. Крупнейший "
+            "драйвер цены покрыт неполно.\n"
+            "- **Физические премии** (катодная премия за бренд/регион, CIF Shanghai, "
+            "Роттердам) — нет бесплатного источника. Биржа ≠ цена контракта. "
+            "Введите свою премию слева — увидите полную цену закупки.\n"
+            "- **Форвардная кривая** — оценивается по cash/3M LME; полная помесячная "
+            "кривая платная и недоступна.")
+
     # --- Почему такой совет ---
     with st.expander("❓ Почему такой совет", expanded=True):
         st.write(v.why)
@@ -700,13 +822,6 @@ def render_buyer():
                              help="ИИ простыми словами объяснит, почему такой прогноз")
     gen_chart = act2.button("📈 Сформировать график", use_container_width=True,
                             help="Построить прогнозную кривую цены меди")
-
-    # Название текущего режима рынка (для контекста отчёта) — из кэша, без падения
-    try:
-        _fit_b, _ = cached_regimes(f"{raw.index.max().date()}_{years}_2", k_regimes=2)
-        regime_label = _fit_b.label_map[_fit_b.current_regime]
-    except Exception:
-        regime_label = "—"
 
     if gen_report:
         import decision_report as dr
