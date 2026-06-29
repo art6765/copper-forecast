@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import ssl
 import subprocess
 import time
@@ -469,13 +470,146 @@ def fetch_fred_bundle(start: str, refresh: bool = False) -> pd.DataFrame:
 
 
 # ============================================================
+#  ЦБ РФ — официальный курс доллара USD/RUB (код R01235)
+# ============================================================
+
+CBR_DYNAMIC_URL = "https://www.cbr.ru/scripts/XML_dynamic.asp"
+CBR_DAILY_JSON_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
+CBR_USD_CODE = "R01235"  # внутренний код доллара США в справочнике ЦБ РФ
+
+
+def _parse_cbr_dynamic(raw: bytes) -> pd.DataFrame:
+    """Парсинг XML ЦБ РФ (XML_dynamic.asp).
+
+    Особенности формата: кодировка windows-1251, десятичный разделитель —
+    запятая, дата в атрибуте Date как ДД.ММ.ГГГГ, курс = Value / Nominal.
+    Возвращает DataFrame с индексом date и колонкой usdrub (руб за 1 USD).
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        # Запасной путь: декодируем вручную и убираем encoding из пролога,
+        # иначе ElementTree ругается на unicode-строку с объявленной кодировкой.
+        text = raw.decode("windows-1251", errors="replace")
+        text = re.sub(r'encoding="[^"]*"', "", text, count=1)
+        root = ET.fromstring(text)
+
+    dates: List = []
+    rates: List[float] = []
+    for rec in root.findall("Record"):
+        d = rec.get("Date")
+        value_el = rec.find("Value")
+        nominal_el = rec.find("Nominal")
+        if d is None or value_el is None or value_el.text is None:
+            continue
+        try:
+            value = float(value_el.text.replace(",", ".").replace(" ", ""))
+            nominal = float((nominal_el.text if nominal_el is not None
+                             and nominal_el.text else "1").replace(",", ".").replace(" ", ""))
+        except ValueError:
+            continue
+        if nominal == 0:
+            continue
+        dates.append(pd.to_datetime(d, format="%d.%m.%Y"))
+        rates.append(value / nominal)
+
+    if not dates:
+        return pd.DataFrame(columns=["usdrub"])
+    df = pd.DataFrame({"usdrub": rates},
+                      index=pd.DatetimeIndex(dates, name="date")).sort_index()
+    return df[~df.index.duplicated(keep="last")]
+
+
+def fetch_cbr_usdrub(start: str = "2020-01-01", refresh: bool = False) -> pd.DataFrame:
+    """История официального курса доллара ЦБ РФ (USD/RUB, код R01235).
+
+    Источник — XML_dynamic.asp (бесплатно, без ключа). Отдаёт весь диапазон
+    дат за один запрос. Кэш — data/cache_cbr_usdrub.csv, накапливается.
+    Возвращает DataFrame: индекс date, колонка usdrub (руб за 1 доллар).
+    При сбое сети — fallback на старый кэш, чтобы не падать целиком.
+    """
+    cache_path = DATA_DIR / "cache_cbr_usdrub.csv"
+    cached = None
+    if cache_path.exists():
+        try:
+            cached = (pd.read_csv(cache_path, parse_dates=["date"])
+                        .set_index("date").sort_index())
+            if not refresh and cached.index.max() >= (
+                    pd.Timestamp(dt.date.today()) - pd.Timedelta(days=2)):
+                return cached
+        except Exception:
+            cached = None
+
+    # Догружаем только хвост, если кэш есть; иначе всю историю от start.
+    if cached is not None and not refresh and not cached.empty:
+        req_start = (cached.index.max() - pd.Timedelta(days=7)).date()
+    else:
+        req_start = dt.datetime.strptime(start, "%Y-%m-%d").date()
+
+    params = {
+        "date_req1": req_start.strftime("%d/%m/%Y"),
+        "date_req2": dt.date.today().strftime("%d/%m/%Y"),
+        "VAL_NM_RQ": CBR_USD_CODE,
+    }
+    try:
+        raw = _get(CBR_DYNAMIC_URL, params, timeout=25)
+        df_new = _parse_cbr_dynamic(raw)
+    except Exception as exc:
+        logger.warning("ЦБ РФ USD/RUB fetch failed: %s", exc)
+        return cached if cached is not None else pd.DataFrame(columns=["usdrub"])
+
+    if df_new.empty:
+        return cached if cached is not None else pd.DataFrame(columns=["usdrub"])
+
+    if cached is not None and not cached.empty:
+        merged = pd.concat([cached, df_new])
+        df_new = merged[~merged.index.duplicated(keep="last")].sort_index()
+
+    df_new.to_csv(cache_path, index_label="date")
+    logger.info("ЦБ РФ USD/RUB: %d строк, %s → %s (последний %.4f ₽/$)",
+                len(df_new), df_new.index.min().date(), df_new.index.max().date(),
+                float(df_new["usdrub"].iloc[-1]))
+    return df_new
+
+
+def fetch_cbr_usdrub_latest() -> Optional[Dict]:
+    """Актуальный курс USD/RUB через cbr-xml-daily.ru (JSON, точка-десятич.).
+
+    Возвращает {date, value, previous} (руб за 1 доллар) или None при сбое.
+    Удобно для отображения «свежего» курса в интерфейсе.
+    """
+    try:
+        data = json.loads(_get(CBR_DAILY_JSON_URL, timeout=15))
+        usd = data["Valute"]["USD"]
+        nominal = float(usd.get("Nominal", 1)) or 1.0
+        return {
+            "date": data.get("Date"),
+            "value": float(usd["Value"]) / nominal,
+            "previous": float(usd.get("Previous", usd["Value"])) / nominal,
+        }
+    except Exception as exc:
+        logger.warning("ЦБ РФ daily_json failed: %s", exc)
+        return None
+
+
+# ============================================================
 #  Main: для отладки
 # ============================================================
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    print("=== CFTC COT ===")
+    print("=== ЦБ РФ USD/RUB ===")
+    try:
+        fx = fetch_cbr_usdrub(start="2024-01-01", refresh=True)
+        print(fx.tail(3))
+        print("latest:", fetch_cbr_usdrub_latest())
+    except Exception as exc:
+        print(f"ЦБ РФ fail: {exc}")
+
+    print("\n=== CFTC COT ===")
     cot = fetch_cftc_cot(years=5, refresh=True)
     print(cot.tail(3))
 

@@ -39,13 +39,26 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+# Сверхкороткие горизонты h_today/h_tomorrow считаются от ПОСЛЕДНЕГО известного
+# дневного закрытия: утром это закрытие предыдущего дня, поэтому «закрытие
+# сегодня» = +1 торговый день (days=1), «закрытие завтра» = +2 (days=2).
+# Берём именно 1 и 2, а не 0: при горизонте 0 цель обучения вырождается в ноль.
 HORIZONS: List[Dict] = [
+    {"key": "h_today",    "label": "Сегодня",   "days": 1},
+    {"key": "h_tomorrow", "label": "Завтра",    "days": 2},
     {"key": "h_3d",  "label": "3 дня",     "days": 3},
     {"key": "h_10d", "label": "10 дней",   "days": 10},
     {"key": "h_1m",  "label": "1 месяц",   "days": 21},
     {"key": "h_3m",  "label": "3 месяца",  "days": 63},
     {"key": "h_6m",  "label": "6 месяцев", "days": 126},
 ]
+
+# На сверхкоротких горизонтах (1–2 дня) направленный ML по тех-фичам/COT —
+# по сути шум: цена за день почти случайна. Для таких горизонтов опираемся
+# на статистические модели (GBM + ARIMA: случайное блуждание с малым дрейфом
+# и дневной волатильностью), а XGBoost/MLP не задействуем — иначе они дают
+# неправдоподобно резкие прогнозы «на завтра».
+ML_MIN_HORIZON_DAYS = 3
 
 
 # ---------- Утилиты для квантилей ----------
@@ -639,6 +652,10 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
         H = h["days"]
         horizon_results: Dict[str, HorizonForecast] = {}
 
+        # Сверхкороткие горизонты: ML глушим, оставляем GBM+ARIMA (см. ML_MIN_HORIZON_DAYS)
+        h_use_xgb = use_xgb and H >= ML_MIN_HORIZON_DAYS
+        h_use_mlp = use_mlp and H >= ML_MIN_HORIZON_DAYS
+
         if use_gbm:
             try:
                 horizon_results["GBM"] = forecast_gbm(prices, H)
@@ -653,7 +670,7 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
 
         # Подготовка X/y для ML-моделей — один раз на горизонт
         X = y = x_now_aligned = None
-        if use_xgb or use_mlp:
+        if h_use_xgb or h_use_mlp:
             try:
                 X, y = prepare_xy(raw_df, H)
                 cols = list(X.columns)
@@ -661,7 +678,7 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
             except Exception as exc:
                 logger.warning("Не удалось собрать X/y для h=%d: %s", H, exc)
 
-        if use_xgb and X is not None:
+        if h_use_xgb and X is not None:
             try:
                 fc, xgb_model = forecast_xgboost(prices, X, y, x_now_aligned, H)
                 horizon_results["XGBoost"] = fc
@@ -672,7 +689,7 @@ def forecast_all_horizons(raw_df: pd.DataFrame,
             except Exception as exc:
                 logger.warning("XGBoost h=%d failed: %s", H, exc)
 
-        if use_mlp and X is not None:
+        if h_use_mlp and X is not None:
             try:
                 fc, _ = forecast_mlp(prices, X, y, x_now_aligned, H)
                 horizon_results["MLP"] = fc

@@ -40,6 +40,8 @@ DB_PATH = Path(__file__).resolve().parent / "data" / "forecast_history.sqlite"
 # Горизонты — синхронизированы с models.HORIZONS. Дублируем как лёгкий фолбэк,
 # чтобы модуль работал даже без импорта тяжёлого models.
 _HORIZONS_FALLBACK: List[Dict] = [
+    {"key": "h_today",    "label": "Сегодня",   "days": 1},
+    {"key": "h_tomorrow", "label": "Завтра",    "days": 2},
     {"key": "h_3d",  "label": "3 дня",     "days": 3},
     {"key": "h_10d", "label": "10 дней",   "days": 10},
     {"key": "h_1m",  "label": "1 месяц",   "days": 21},

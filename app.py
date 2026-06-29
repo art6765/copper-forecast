@@ -47,6 +47,7 @@ from buyer_logic import (
 import history_db
 import brief
 import lme_forecast as lf
+import usd_forecast as uf
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -83,6 +84,15 @@ def cached_forecast(_raw_signature: str, years: int,
             except Exception:
                 pass
     return raw, results, df, explanations
+
+
+@st.cache_data(ttl=3600, show_spinner="Прогнозирую курс доллара…")
+def cached_usdrub_forecast(_raw_signature: str, years: int):
+    """Прогноз курса доллара ЦБ РФ (USD/RUB) тем же движком, что и медь.
+    Возвращает {horizon_key: {model_name: HorizonForecast}} в рублях за доллар."""
+    start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
+    raw = load_all(start=start)
+    return uf.forecast_usdrub(raw)
 
 
 @st.cache_data(ttl=3600, show_spinner="Идентифицирую режимы…")
@@ -395,6 +405,15 @@ try:
 except Exception:
     lme_direct_df, lme_direct_models = pd.DataFrame(), []
 
+# Прогноз курса доллара (USD/RUB, ЦБ РФ) — для рублёвых цен в карточке,
+# ИИ-отчёта и прогнозного графика. Кэшируется (обучение моделей не дешёвое).
+try:
+    _sig_fx = f"{raw.index.max().date()}_{years}_usdrub"
+    usd_results = cached_usdrub_forecast(_sig_fx, years)
+except Exception:
+    usd_results = {}
+usd_current = uf.current_usdrub(raw)
+
 if not historical_mode:
     try:
         _jr = history_db.record_live_forecast(
@@ -491,6 +510,48 @@ def _conf_light(conf: int, color: str) -> str:
     return f"<span class='conf-light'>{dots}</span>"
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _forecast_curve_fig(hist, last_date, points, unit_label, color,
+                        value_fmt=",.0f"):
+    """Прогнозная кривая: история + будущая траектория с коридором p10–p90.
+
+    hist — pd.Series (история, индекс = даты); points — список dict
+    {days, med, p10, p90}; color — hex цвет линии прогноза.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=hist.values, mode="lines", name="История",
+        line=dict(color="#001829", width=1.6)))
+    # Будущие даты: бизнес-дни горизонта ≈ 1.4 календарных
+    fut_dates = [last_date + pd.Timedelta(days=int(p["days"] * 1.4)) for p in points]
+    fut_med = [p["med"] for p in points]
+    fut_p10 = [p["p10"] for p in points]
+    fut_p90 = [p["p90"] for p in points]
+    # Коридор 80% (заливка между p10 и p90)
+    fig.add_trace(go.Scatter(
+        x=fut_dates + fut_dates[::-1], y=fut_p90 + fut_p10[::-1],
+        fill="toself", fillcolor=_hex_to_rgba(color, 0.13),
+        line=dict(color="rgba(0,0,0,0)"), name="Коридор 80%", hoverinfo="skip"))
+    # Линия прогноза — стартует от последней точки истории
+    x_line = [last_date] + fut_dates
+    y_line = [float(hist.iloc[-1])] + fut_med
+    fig.add_trace(go.Scatter(
+        x=x_line, y=y_line, mode="lines+markers", name="Прогноз",
+        line=dict(color=color, width=2.4, dash="dot"),
+        marker=dict(size=7, color=color),
+        hovertemplate="%{x|%d.%m.%Y}: %{y:" + value_fmt + "}<extra></extra>"))
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=30, b=10), yaxis_title=unit_label,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified")
+    return fig
+
+
 def render_buyer():
     spot_lb = float(raw["copper"].iloc[-1])
     spot_t_comex = spot_lb * LB_PER_TON
@@ -529,7 +590,7 @@ def render_buyer():
                  "ансамбль из 2 моделей.")
         return
 
-    hz_order = ["h_3d", "h_10d", "h_1m", "h_3m", "h_6m"]
+    hz_order = ["h_today", "h_tomorrow", "h_3d", "h_10d", "h_1m", "h_3m", "h_6m"]
     hz_avail = [h for h in hz_order if h in verdicts]
     hz_labels = {h: verdicts[h].horizon_label for h in hz_avail}
 
@@ -544,10 +605,47 @@ def render_buyer():
     p10 = v.p10_usd_t * _factor
     p90 = v.p90_usd_t * _factor
 
+    # --- Курс доллара и рублёвые цены (Фаза D) ---
+    # Прогнозный курс на выбранный горизонт берём из модели USD/RUB; если её нет —
+    # откатываемся на текущий курс ЦБ РФ. Рублёвую цену меди считаем по прогнозному
+    # курсу (прогноз×прогноз), а текущую — по сегодняшнему курсу.
+    fx_fc = (usd_results.get(chosen) or {}).get("Ensemble") if usd_results else None
+    fx_now = usd_current                                    # текущий курс ЦБ РФ, ₽/$
+    fx_fore = float(fx_fc.point) if fx_fc is not None else fx_now   # прогнозный курс
+    med_rub = med * fx_fore if fx_fore else None            # прогнозная цена меди, ₽/т
+    fx_change = ((fx_fore / fx_now - 1) * 100) if (fx_fore and fx_now) else None
+
+    # Строка рублёвой цены меди (если курс доступен)
+    if med_rub:
+        rub_line = (
+            "<div class='verdict-rub' style='font-size:18px;color:#001829;"
+            "font-weight:700;margin-top:2px'>"
+            f"≈ {med_rub:,.0f}<span style='font-weight:400;color:#7F8B93'> ₽/т</span>"
+            "</div>")
+    else:
+        rub_line = ""
+    # Строка прогнозного курса доллара (рост курса = рубль слабее = дороже закупка → красный)
+    if fx_fore:
+        if fx_change is not None and abs(fx_change) >= 0.1:
+            _ar = "▲" if fx_change > 0 else "▼"
+            _col = "#E00613" if fx_change > 0 else "#198754"
+            chg_txt = f" <span style='color:{_col};font-weight:600'>{_ar} {abs(fx_change):.1f}%</span>"
+        else:
+            chg_txt = ""
+        now_txt = (f" <span style='color:#7F8B93'>· сейчас {fx_now:.2f}</span>"
+                   if fx_now else "")
+        fx_line = (
+            "<div class='verdict-rub'>Курс доллара (прогноз): "
+            f"<b>{fx_fore:.2f} ₽/$</b>{chg_txt}{now_txt}</div>")
+    else:
+        fx_line = ("<div class='verdict-rub' style='opacity:.7'>"
+                   "Курс доллара ЦБ РФ — источник недоступен</div>")
+
     # --- Карточка вердикта ---
     tone_bg = {"ok": "rgba(25,135,84,.12)", "warn": "rgba(245,158,11,.14)",
                "wait": "rgba(224,6,19,.10)"}[v.tone]
-    sub_label = {"h_3d": "ближайшая поставка", "h_10d": "спот-закупка",
+    sub_label = {"h_today": "закрытие сегодня", "h_tomorrow": "закрытие завтра",
+                 "h_3d": "ближайшая поставка", "h_10d": "спот-закупка",
                  "h_1m": "месячный контракт", "h_3m": "квартальный контракт",
                  "h_6m": "полугодовой контракт"}.get(chosen, "")
 
@@ -556,8 +654,10 @@ def render_buyer():
   <div class='rail' style='background:{v.color}'></div>
   <div style='padding-left:14px'>
     <div class='verdict-eyebrow'>Цель на {v.horizon_label.lower()} · {sub_label}</div>
-    <div class='verdict-price'>{med:,.0f}<span class='u'> /т</span></div>
-    <div class='verdict-rub'>p10–p90: {p10:,.0f} – {p90:,.0f} USD/т</div>
+    <div class='verdict-price'>{med:,.0f}<span class='u'> USD/т</span></div>
+    {rub_line}
+    {fx_line}
+    <div class='verdict-rub' style='opacity:.7;margin-top:2px'>Коридор {p10:,.0f} – {p90:,.0f} USD/т</div>
     <div class='verdict-tag' style='background:{tone_bg};color:{v.color}'>
       <span style='font-size:24px'>{v.icon}</span> {v.label}
       <span style='font-weight:600;color:#7F8B93'>· {v.ru}</span>
@@ -592,6 +692,120 @@ def render_buyer():
                 for f in factors
             )
             st.markdown(chips, unsafe_allow_html=True)
+
+    # --- Действия: ИИ-отчёт и прогнозный график (Фазы E, F) ---
+    st.markdown("##### 🧰 Действия")
+    act1, act2 = st.columns(2)
+    gen_report = act1.button("📝 Сформировать отчёт", use_container_width=True,
+                             help="ИИ простыми словами объяснит, почему такой прогноз")
+    gen_chart = act2.button("📈 Сформировать график", use_container_width=True,
+                            help="Построить прогнозную кривую цены меди")
+
+    # Название текущего режима рынка (для контекста отчёта) — из кэша, без падения
+    try:
+        _fit_b, _ = cached_regimes(f"{raw.index.max().date()}_{years}_2", k_regimes=2)
+        regime_label = _fit_b.label_map[_fit_b.current_regime]
+    except Exception:
+        regime_label = "—"
+
+    if gen_report:
+        import decision_report as dr
+        if not dr.has_api_key():
+            st.warning("ИИ-отчёт недоступен: не задан ключ DEEPSEEK_API_KEY (.env). "
+                       "Базовое объяснение — в блоке «Почему такой совет» выше.")
+        else:
+            # Обзор по всем горизонтам (медь USD/т + рубли + прогнозный курс)
+            all_h = []
+            for hk in hz_avail:
+                vv = verdicts[hk]
+                mm = vv.median_usd_t * _factor
+                ffx = (usd_results.get(hk) or {}).get("Ensemble") if usd_results else None
+                ff = float(ffx.point) if ffx is not None else fx_now
+                all_h.append({"label": vv.horizon_label, "med_usd_t": mm,
+                              "change_pct": vv.change_pct,
+                              "med_rub": (mm * ff if ff else None), "fx_fore": ff})
+            ctx = {
+                "as_of": str(raw.index.max().date()), "unit": _unit,
+                "spot_usd_t": spot_t, "current_usdrub": fx_now,
+                "regime": regime_label,
+                "horizon_label": v.horizon_label, "horizon_sub": sub_label,
+                "verdict": v.label, "verdict_ru": v.ru, "verdict_why": v.why,
+                "change_pct": v.change_pct, "med_usd_t": med,
+                "p10": p10, "p90": p90, "prob_up": v.prob_up * 100,
+                "med_rub": med_rub, "fx_fore": fx_fore, "fx_change": fx_change,
+                "factors": buyer_factors(raw), "all_horizons": all_h,
+            }
+            try:
+                with st.spinner("ИИ готовит отчёт…"):
+                    st.session_state["buyer_report"] = dr.generate_report(ctx)
+                    st.session_state["buyer_report_meta"] = (
+                        f"{v.horizon_label} · данные на {raw.index.max().date()}")
+            except Exception as exc:
+                st.error(f"Не удалось сформировать отчёт: {exc}")
+
+    if st.session_state.get("buyer_report"):
+        st.markdown("#### 📝 Отчёт по прогнозу")
+        st.markdown(st.session_state["buyer_report"])
+        st.caption(f"Сформировано ИИ · {st.session_state.get('buyer_report_meta', '')}. "
+                   "Не является инвестиционной рекомендацией.")
+
+    # --- Прогнозный график (Фаза F) ---
+    if gen_chart:
+        st.session_state["show_buyer_chart"] = True
+    if st.session_state.get("show_buyer_chart"):
+        st.markdown("#### 📈 Прогнозная кривая")
+        instr = st.radio("Что показать на графике",
+                         ["Медь, USD/т", "Медь, ₽/т", "Курс доллара, ₽/$"],
+                         horizontal=True, key="buyer_chart_instr")
+        h_days = {h["key"]: h["days"] for h in HORIZONS}
+
+        def _fx_at(hk):
+            ff = (usd_results.get(hk) or {}).get("Ensemble") if usd_results else None
+            return float(ff.point) if ff is not None else (fx_now or 1.0)
+
+        try:
+            if instr == "Курс доллара, ₽/$":
+                if not usd_results:
+                    st.info("Прогноз курса недоступен — нет данных ЦБ РФ.")
+                else:
+                    hist = uf.usdrub_series(raw).tail(180)
+                    pts = [{"days": h_days.get(hk, 1), "med": ff.point,
+                            "p10": ff.p10, "p90": ff.p90}
+                           for hk in hz_avail
+                           if (ff := (usd_results.get(hk) or {}).get("Ensemble")) is not None]
+                    fig_c = _forecast_curve_fig(hist, hist.index[-1], pts,
+                                                "₽ за $", "#198754", ",.2f")
+                    st.plotly_chart(fig_c, use_container_width=True)
+                    st.caption("История официального курса ЦБ РФ и прогноз с коридором 80%.")
+            elif instr == "Медь, ₽/т":
+                base = (raw["lme_3m"].dropna() if _has_lme else raw["copper"] * LB_PER_TON)
+                if "usdrub" not in raw.columns:
+                    st.info("Курс ЦБ РФ недоступен — рублёвую кривую построить нельзя.")
+                else:
+                    fxh = raw["usdrub"].reindex(base.index).ffill()
+                    hist = (base * fxh).dropna().tail(180)
+                    pts = [{"days": h_days.get(hk, 1),
+                            "med": verdicts[hk].median_usd_t * _factor * _fx_at(hk),
+                            "p10": verdicts[hk].p10_usd_t * _factor * _fx_at(hk),
+                            "p90": verdicts[hk].p90_usd_t * _factor * _fx_at(hk)}
+                           for hk in hz_avail]
+                    fig_c = _forecast_curve_fig(hist, hist.index[-1], pts,
+                                                "₽ за тонну", "#B5651D")
+                    st.plotly_chart(fig_c, use_container_width=True)
+                    st.caption("Цена тонны меди в рублях: прогноз цены × прогноз курса, с коридором.")
+            else:  # Медь, USD/т
+                hist = (raw["lme_3m"].dropna() if _has_lme
+                        else raw["copper"] * LB_PER_TON).tail(180)
+                pts = [{"days": h_days.get(hk, 1),
+                        "med": verdicts[hk].median_usd_t * _factor,
+                        "p10": verdicts[hk].p10_usd_t * _factor,
+                        "p90": verdicts[hk].p90_usd_t * _factor}
+                       for hk in hz_avail]
+                fig_c = _forecast_curve_fig(hist, hist.index[-1], pts, "USD/т", "#B5651D")
+                st.plotly_chart(fig_c, use_container_width=True)
+                st.caption(f"Цена меди ({_unit}) и прогноз по горизонтам с коридором 80%.")
+        except Exception as exc:
+            st.error(f"Не удалось построить график: {exc}")
 
     # --- Коридор + календарь рисков ---
     col_cor, col_risk = st.columns([1, 1])

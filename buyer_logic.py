@@ -82,6 +82,8 @@ def _confidence(p10: float, p90: float, median: float,
 
 
 HORIZON_SUB = {
+    "h_today":    ("Сегодня", "закрытие сегодня"),
+    "h_tomorrow": ("Завтра", "закрытие завтра"),
     "h_3d":  ("3 дня", "ближайшая поставка"),
     "h_10d": ("10 дней", "спот-закупка"),
     "h_1m":  ("1 месяц", "месячный контракт"),
@@ -161,7 +163,7 @@ def all_verdicts(forecasts: Dict, spot_usd_lb: float,
                  regime_calm_prob: Optional[float] = None) -> Dict[str, Verdict]:
     """Вердикты по всем горизонтам — для селектора горизонта."""
     out = {}
-    for hk in ["h_3d", "h_10d", "h_1m", "h_3m", "h_6m"]:
+    for hk in ["h_today", "h_tomorrow", "h_3d", "h_10d", "h_1m", "h_3m", "h_6m"]:
         v = compute_verdict(forecasts, hk, spot_usd_lb, regime_calm_prob)
         if v:
             out[hk] = v

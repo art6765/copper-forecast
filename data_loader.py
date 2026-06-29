@@ -133,7 +133,8 @@ def fetch_ticker(ticker: str, start: str, use_cache: bool = True,
 def load_all(start: str = "2020-01-01", refresh: bool = False,
              include_cot: bool = True, include_lme_stocks: bool = True,
              include_lme_price: bool = True,
-             include_fred: bool = True) -> pd.DataFrame:
+             include_fred: bool = True,
+             include_cbr: bool = True) -> pd.DataFrame:
     """
     Возвращает единый DataFrame с дневной частотой и колонками:
       copper, copper_high, copper_low, copper_volume,
@@ -179,17 +180,19 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
     out = out.reindex(bdays)
     out = out.ffill(limit=5).dropna(subset=["copper"])
 
-    # --- Дополнительные источники (CFTC COT, LME stocks, LME price, FRED) ---
-    if include_cot or include_lme_stocks or include_lme_price or include_fred:
+    # --- Дополнительные источники (CFTC COT, LME stocks, LME price, FRED, ЦБ РФ) ---
+    if include_cot or include_lme_stocks or include_lme_price or include_fred or include_cbr:
         try:
             from extra_sources import (fetch_cftc_cot, cot_to_daily,
                                         fetch_lme_stocks_westmetall,
                                         fetch_lme_copper_price,
-                                        fetch_fred_bundle)
+                                        fetch_fred_bundle,
+                                        fetch_cbr_usdrub)
         except ImportError as exc:
             logger.warning("extra_sources недоступен: %s", exc)
             fetch_cftc_cot = fetch_lme_stocks_westmetall = None
             fetch_lme_copper_price = fetch_fred_bundle = None
+            fetch_cbr_usdrub = None
 
         if include_cot and fetch_cftc_cot is not None:
             try:
@@ -252,6 +255,18 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
                     logger.info("FRED добавлен: %d рядов", fred.shape[1])
             except Exception as exc:
                 logger.warning("FRED не загружен: %s", exc)
+
+        # ---------- Курс доллара ЦБ РФ (USD/RUB) — для рублёвых цен и прогноза ----------
+        if include_cbr and fetch_cbr_usdrub is not None:
+            try:
+                fx = fetch_cbr_usdrub(start=start, refresh=refresh)
+                if not fx.empty:
+                    fx_d = fx.reindex(out.index, method="ffill")
+                    out["usdrub"] = fx_d["usdrub"]
+                    logger.info("ЦБ РФ USD/RUB добавлен: последний %.2f ₽/$",
+                                float(fx["usdrub"].iloc[-1]))
+            except Exception as exc:
+                logger.warning("ЦБ РФ USD/RUB не загружен: %s", exc)
 
     return out
 
