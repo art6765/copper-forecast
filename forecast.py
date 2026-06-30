@@ -135,6 +135,42 @@ def _plot_correlations(raw: pd.DataFrame, out_path: Path):
     logger.info("График корреляций сохранён: %s", out_path)
 
 
+def _warm_dashboard_cache(raw, results, df_fc, xgb_models, xgb_x_now, years,
+                          use_xgb, use_mlp, use_arima, use_gbm):
+    """Прогрев диск-кэша дашборда (data/state_*.pkl), чтобы первый утренний заход
+    в Streamlit открывался мгновенно, без переобучения. Сигнатура строится из тех
+    же флагов, что и в app.py: при дефолтном ночном запуске (5 лет, все 4 модели)
+    она совпадёт с дефолтом дашборда. При иных настройках дашборд переобучит сам."""
+    import pickle
+    import usd_forecast as uf
+
+    data_dir = Path(__file__).resolve().parent / "data"
+    data_dir.mkdir(exist_ok=True)
+    last = raw.index.max().date()
+
+    # SHAP-объяснения — как в app.cached_forecast
+    explanations = {}
+    for hk, m in xgb_models.items():
+        if hk in xgb_x_now:
+            try:
+                contrib_df, meta = m.explain(xgb_x_now[hk], top_n=10)
+                explanations[hk] = {"df": contrib_df, "meta": meta}
+            except Exception:
+                pass
+
+    sig_med = f"{last}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}"
+    (data_dir / "state_forecast.pkl").write_bytes(
+        pickle.dumps({"sig": sig_med,
+                      "payload": (raw, results, df_fc, explanations)}))
+
+    # Курс — облегчённый GBM+ARIMA, как в app.cached_usdrub_forecast
+    usd_results = uf.forecast_usdrub(raw, use_xgb=False, use_mlp=False)
+    sig_fx = f"{last}_{years}_usdrub"
+    (data_dir / "state_usdrub.pkl").write_bytes(
+        pickle.dumps({"sig": sig_fx, "payload": usd_results}))
+    logger.info("Прогрет диск-кэш дашборда (state_forecast.pkl + state_usdrub.pkl)")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Прогноз цены меди — MVP")
     parser.add_argument("--years", type=int, default=5,
@@ -161,12 +197,15 @@ def main(argv=None):
     _print_header(raw)
 
     # ---- 1. Прогнозы ----
+    xgb_models, xgb_x_now = {}, {}
     results = forecast_all_horizons(
         raw,
         use_xgb=not args.no_xgb,
         use_mlp=not args.no_mlp,
         use_arima=not args.no_arima,
         use_gbm=True,
+        xgb_models_out=xgb_models,
+        xgb_x_now_out=xgb_x_now,
     )
     df_fc = forecasts_to_dataframe(results)
     df_fc_pretty = _format_forecast_table(df_fc)
@@ -224,6 +263,13 @@ def main(argv=None):
                     logger.info("Telegram-алерт отправлен (смена сигнала)")
     except Exception as exc:
         logger.warning("Алерт не отправлен: %s", exc)
+
+    # ---- 2d. Прогрев диск-кэша дашборда (чтобы первый утренний заход был мгновенным) ----
+    try:
+        _warm_dashboard_cache(raw, results, df_fc, xgb_models, xgb_x_now, args.years,
+                              not args.no_xgb, not args.no_mlp, not args.no_arima, True)
+    except Exception as exc:
+        logger.warning("Прогрев кэша дашборда не удался: %s", exc)
 
     # ---- 3. Графики ----
     try:
