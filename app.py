@@ -152,6 +152,16 @@ def cached_accuracy(_sig: str, market: str = "COMEX"):
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_intraday_copper(_slot: str):
+    """Свежий внутридневной спот меди (обновляется ~раз в 10 минут)."""
+    try:
+        from data_loader import fetch_copper_spot_now
+        return fetch_copper_spot_now()
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=86400, show_spinner="Идентифицирую режимы…")
 def cached_regimes(_raw_signature: str, k_regimes: int = 2):
     from regimes import fit_markov_regimes
@@ -658,6 +668,29 @@ def render_buyer():
         st.caption(f"Медь · {_unit} · спот **{spot_t:,.0f} USD/т** · "
                    f"данные на {raw.index.max().date()}")
 
+    # --- Внутридневной показ: свежая котировка «сейчас» (Фаза J) ---
+    # Прогноз строится на дневном закрытии; ночной пересчёт — раз в сутки. Здесь
+    # показываем самую свежую цену в течение дня (COMEX HG=F, задержка ~15 мин) и её
+    # отклонение от закрытия — чтобы видеть движение, не дожидаясь следующего расчёта.
+    # Кэш с 10-минутным слотом: данные подтягиваются заново примерно раз в 10 минут.
+    _slot = dt.datetime.now().strftime("%Y%m%d_%H%M")[:-1]   # ~10-минутная корзина
+    intraday = cached_intraday_copper(_slot)
+    if intraday and intraday.get("price_usd_t"):
+        _ip = intraday["price_usd_t"]
+        _delta = (_ip / spot_t_comex - 1) * 100 if spot_t_comex else 0.0
+        _t = intraday.get("time")
+        _ts = _t.strftime("%H:%M") if hasattr(_t, "strftime") else ""
+        _ic = "#E00613" if _delta > 0.05 else "#198754" if _delta < -0.05 else "#7F8B93"
+        _arr = "▲" if _delta > 0.05 else "▼" if _delta < -0.05 else "•"
+        st.markdown(
+            f"<div style='font-size:13px;color:#46535B;margin:-2px 0 8px;padding:7px 12px;"
+            f"background:#FFF8F0;border:1px solid #F2E4D2;border-radius:6px'>"
+            f"🔴 <b>Сейчас (внутри дня, COMEX):</b> {_ip:,.0f} USD/т "
+            f"<span style='color:{_ic};font-weight:600'>{_arr}&nbsp;{abs(_delta):.2f}%</span> "
+            f"<span style='color:#7F8B93'>к закрытию · обновлено {_ts} · "
+            f"прогноз считается по дневному закрытию</span></div>",
+            unsafe_allow_html=True)
+
     # --- Селектор горизонта ---
     # compute_verdict ждёт {hk: {model_name: HorizonForecast}}.
     # custom_ens[hk] — это один HorizonForecast (наш ансамбль с весами),
@@ -912,8 +945,8 @@ def render_buyer():
     act1, act2 = st.columns(2)
     gen_report = act1.button("📝 Сформировать отчёт", use_container_width=True,
                              help="ИИ простыми словами объяснит, почему такой прогноз")
-    gen_chart = act2.button("📈 Сформировать график", use_container_width=True,
-                            help="Построить прогнозную кривую цены меди")
+    gen_chart = act2.button("📈 Показать графики", use_container_width=True,
+                            help="Прогнозные кривые: отдельно медь и отдельно курс рубля")
 
     if gen_report:
         import decision_report as dr
@@ -960,18 +993,54 @@ def render_buyer():
     if gen_chart:
         st.session_state["show_buyer_chart"] = True
     if st.session_state.get("show_buyer_chart"):
-        st.markdown("#### 📈 Прогнозная кривая")
-        instr = st.radio("Что показать на графике",
-                         ["Медь, USD/т", "Медь, ₽/т", "Курс доллара, ₽/$"],
-                         horizontal=True, key="buyer_chart_instr")
+        st.markdown("#### 📈 Прогнозные кривые")
         h_days = {h["key"]: h["days"] for h in HORIZONS}
 
         def _fx_at(hk):
             ff = (usd_results.get(hk) or {}).get("Ensemble") if usd_results else None
             return float(ff.point) if ff is not None else (fx_now or 1.0)
 
-        try:
-            if instr == "Курс доллара, ₽/$":
+        # Два отдельных графика на разных вкладках: прогноз цены меди и прогноз курса
+        # рубля. Раньше это был один график с переключателем — вывод по каждому активу
+        # терялся; теперь медь и валюта разнесены и видны по отдельности.
+        tab_cu, tab_fx = st.tabs(["🟫 Прогноз цены меди", "💱 Прогноз курса рубля"])
+
+        with tab_cu:
+            unit_cu = st.radio("Валюта цены", ["USD/т", "₽/т"],
+                               horizontal=True, key="buyer_chart_cu_unit")
+            try:
+                if unit_cu == "₽/т":
+                    base = (raw["lme_3m"].dropna() if _has_lme else raw["copper"] * LB_PER_TON)
+                    if "usdrub" not in raw.columns:
+                        st.info("Курс ЦБ РФ недоступен — рублёвую кривую построить нельзя.")
+                    else:
+                        fxh = raw["usdrub"].reindex(base.index).ffill()
+                        hist = (base * fxh).dropna().tail(180)
+                        pts = [{"days": h_days.get(hk, 1),
+                                "med": verdicts[hk].median_usd_t * _factor * _fx_at(hk),
+                                "p10": verdicts[hk].p10_usd_t * _factor * _fx_at(hk),
+                                "p90": verdicts[hk].p90_usd_t * _factor * _fx_at(hk)}
+                               for hk in hz_avail]
+                        fig_c = _forecast_curve_fig(hist, hist.index[-1], pts,
+                                                    "₽ за тонну", "#B5651D")
+                        st.plotly_chart(fig_c, use_container_width=True)
+                        st.caption("Цена тонны меди в рублях: прогноз цены × прогноз курса, с коридором 80%.")
+                else:  # USD/т
+                    hist = (raw["lme_3m"].dropna() if _has_lme
+                            else raw["copper"] * LB_PER_TON).tail(180)
+                    pts = [{"days": h_days.get(hk, 1),
+                            "med": verdicts[hk].median_usd_t * _factor,
+                            "p10": verdicts[hk].p10_usd_t * _factor,
+                            "p90": verdicts[hk].p90_usd_t * _factor}
+                           for hk in hz_avail]
+                    fig_c = _forecast_curve_fig(hist, hist.index[-1], pts, "USD/т", "#B5651D")
+                    st.plotly_chart(fig_c, use_container_width=True)
+                    st.caption(f"Цена меди ({_unit}) и прогноз по горизонтам с коридором 80%.")
+            except Exception as exc:
+                st.error(f"Не удалось построить график меди: {exc}")
+
+        with tab_fx:
+            try:
                 if not usd_results:
                     st.info("Прогноз курса недоступен — нет данных ЦБ РФ.")
                 else:
@@ -983,36 +1052,10 @@ def render_buyer():
                     fig_c = _forecast_curve_fig(hist, hist.index[-1], pts,
                                                 "₽ за $", "#198754", ",.2f")
                     st.plotly_chart(fig_c, use_container_width=True)
-                    st.caption("История официального курса ЦБ РФ и прогноз с коридором 80%.")
-            elif instr == "Медь, ₽/т":
-                base = (raw["lme_3m"].dropna() if _has_lme else raw["copper"] * LB_PER_TON)
-                if "usdrub" not in raw.columns:
-                    st.info("Курс ЦБ РФ недоступен — рублёвую кривую построить нельзя.")
-                else:
-                    fxh = raw["usdrub"].reindex(base.index).ffill()
-                    hist = (base * fxh).dropna().tail(180)
-                    pts = [{"days": h_days.get(hk, 1),
-                            "med": verdicts[hk].median_usd_t * _factor * _fx_at(hk),
-                            "p10": verdicts[hk].p10_usd_t * _factor * _fx_at(hk),
-                            "p90": verdicts[hk].p90_usd_t * _factor * _fx_at(hk)}
-                           for hk in hz_avail]
-                    fig_c = _forecast_curve_fig(hist, hist.index[-1], pts,
-                                                "₽ за тонну", "#B5651D")
-                    st.plotly_chart(fig_c, use_container_width=True)
-                    st.caption("Цена тонны меди в рублях: прогноз цены × прогноз курса, с коридором.")
-            else:  # Медь, USD/т
-                hist = (raw["lme_3m"].dropna() if _has_lme
-                        else raw["copper"] * LB_PER_TON).tail(180)
-                pts = [{"days": h_days.get(hk, 1),
-                        "med": verdicts[hk].median_usd_t * _factor,
-                        "p10": verdicts[hk].p10_usd_t * _factor,
-                        "p90": verdicts[hk].p90_usd_t * _factor}
-                       for hk in hz_avail]
-                fig_c = _forecast_curve_fig(hist, hist.index[-1], pts, "USD/т", "#B5651D")
-                st.plotly_chart(fig_c, use_container_width=True)
-                st.caption(f"Цена меди ({_unit}) и прогноз по горизонтам с коридором 80%.")
-        except Exception as exc:
-            st.error(f"Не удалось построить график: {exc}")
+                    st.caption("Официальный курс ЦБ РФ (USD/RUB) и прогноз с коридором 80%. "
+                               "Рост курса = рубль слабее = дороже закупка.")
+            except Exception as exc:
+                st.error(f"Не удалось построить график курса: {exc}")
 
     # --- Коридор + календарь рисков ---
     col_cor, col_risk = st.columns([1, 1])
