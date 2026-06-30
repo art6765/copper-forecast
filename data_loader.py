@@ -276,6 +276,23 @@ def copper_usd_per_ton(series: pd.Series) -> pd.Series:
     return series * LB_PER_TON
 
 
+def fetch_copper_spot_now():
+    """Свежая внутридневная котировка меди COMEX (HG=F, задержка ~15 мин).
+
+    Прогноз строится на дневном закрытии; эта функция даёт самую свежую цену
+    «сейчас» — чтобы показать текущую цену в течение дня. None при сбое.
+    Возвращает {price_lb, price_usd_t, time}.
+    """
+    try:
+        h = yf.Ticker("HG=F").history(period="1d", interval="5m", auto_adjust=False)
+        if h is None or h.empty:
+            return None
+        lb = float(h["Close"].dropna().iloc[-1])
+        return {"price_lb": lb, "price_usd_t": lb * LB_PER_TON, "time": h.index[-1]}
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     five_years_ago = (dt.date.today() - dt.timedelta(days=5 * 365 + 30)).strftime("%Y-%m-%d")

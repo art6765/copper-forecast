@@ -218,8 +218,9 @@ def buyer_factors(raw_df: pd.DataFrame) -> List[Dict]:
 
 
 def recommend_allocation(verdict_key: str, regime_label: str = "",
-                         confidence: int = 60,
-                         change_pct: float = 0.0) -> Dict:
+                         confidence: int = 60, change_pct: float = 0.0,
+                         prob_up: Optional[float] = None,
+                         band_pct: Optional[float] = None) -> Dict:
     """Рекомендация по ОБЪЁМУ закупки под текущую ситуацию.
 
     Принцип асимметрии потерь закупщика: остаться без металла к сроку дороже,
@@ -237,42 +238,47 @@ def recommend_allocation(verdict_key: str, regime_label: str = "",
     bullish = any(k in rl for k in ["bull", "дефицит", "перегрев"])
     bearish = any(k in rl for k in ["bear", "профицит", "затовар"])
 
-    # База по вердикту (логика закупщика: цена вверх → берём больше сейчас)
-    base = {"urgent": 80, "buy": 62, "watch": 45, "wait": 35}.get(verdict_key, 45)
+    # Ядро — вероятность роста (прямой выход модели). Высокая → берём много сейчас.
+    if prob_up is not None:
+        base = 45 + (prob_up - 0.5) * 130   # 0.5→45, 0.77→80, ≥0.85→верх, ≤0.35→к якорю
+    else:
+        base = {"urgent": 80, "buy": 62, "watch": 45, "wait": 35}.get(verdict_key, 45)
 
-    # Поправка на режим рынка
+    # Неопределённость: широкий коридор → осторожнее с разовым объёмом
+    if band_pct is not None and band_pct > 8:
+        base -= (band_pct - 8) * 0.7
+
+    # Режим рынка — модулятор
     if turbulent:
-        base -= 8                       # высокая вола — осторожнее с разовым объёмом
-    if bullish and verdict_key in ("urgent", "buy"):
-        base += 5                       # подтверждённый дефицит — увереннее
-    if bearish and verdict_key in ("wait", "watch"):
-        base -= 5                       # профицит — ближе к минимуму
-
-    # Поправка на уверенность модели (узкий коридор/спокойный режим)
-    base += (confidence - 60) * 0.25    # ≈ +10% при conf 100, −15% при conf 0
+        base -= 6
+    if bullish and (prob_up is None or prob_up > 0.55):
+        base += 4
+    if bearish and (prob_up is None or prob_up < 0.5):
+        base -= 4
 
     floor_pct = 35                      # якорь: минимум берём всегда
     immediate = int(round(max(floor_pct, min(88, base)) / 5) * 5)
 
-    # Лесенка: когда не срочно — дробим сильнее (больше усреднения)
+    # Лесенка: когда не срочно или неопределённо — дробим сильнее
     tranches = 3 if verdict_key in ("urgent", "buy") else 4
-    if turbulent:
+    if turbulent or (band_pct is not None and band_pct > 14):
         tranches = min(5, tranches + 1)
 
     tone = {"urgent": "ok", "buy": "ok", "watch": "warn", "wait": "wait"}.get(
         verdict_key, "warn")
 
+    pu = f"Вероятность роста {prob_up * 100:.0f}%. " if prob_up is not None else ""
     if verdict_key == "urgent":
-        rationale = (f"Цена идёт вверх — берём большую часть ({immediate}%) сейчас, "
+        rationale = (f"{pu}Цена идёт вверх — берём большую часть ({immediate}%) сейчас, "
                      f"остальное дробим на {tranches} транша от непредвиденного отката.")
     elif verdict_key == "buy":
-        rationale = (f"Умеренный риск роста — берём {immediate}% сейчас, остальное "
+        rationale = (f"{pu}Умеренный риск роста — берём {immediate}% сейчас, остальное "
                      f"лесенкой на {tranches} транша.")
     elif verdict_key == "wait":
-        rationale = (f"Вероятен откат — держим якорный минимум {immediate}%, "
+        rationale = (f"{pu}Вероятен откат — держим якорный минимум {immediate}%, "
                      f"остальное добираем позже {tranches} траншами на снижении.")
     else:  # watch
-        rationale = (f"Движения нет — берём {immediate}% и спокойно добираем "
+        rationale = (f"{pu}Движения нет — берём {immediate}% и спокойно добираем "
                      f"{tranches} траншами по мере потребности.")
     if turbulent:
         rationale += " Рынок турбулентный — дробим сильнее."

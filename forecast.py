@@ -164,8 +164,8 @@ def _warm_dashboard_cache(raw, results, df_fc, xgb_models, xgb_x_now, years,
                       "payload": (raw, results, df_fc, explanations)}))
 
     # Курс — облегчённый GBM+ARIMA, как в app.cached_usdrub_forecast
-    usd_results = uf.forecast_usdrub(raw, use_xgb=False, use_mlp=False)
-    sig_fx = f"{last}_{years}_usdrub"
+    usd_results = uf.forecast_usdrub(raw)
+    sig_fx = f"{last}_{years}_usdrub_full"
     (data_dir / "state_usdrub.pkl").write_bytes(
         pickle.dumps({"sig": sig_fx, "payload": usd_results}))
     logger.info("Прогрет диск-кэш дашборда (state_forecast.pkl + state_usdrub.pkl)")

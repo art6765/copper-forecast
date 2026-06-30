@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 # Порог острого дефицита (бэквордация), USD/т — ориентир из интервью с экспертом.
@@ -62,6 +63,42 @@ def carry_signal(raw: pd.DataFrame) -> Optional[Dict]:
             "cash": cash, "m3": m3, "tone": tone, "note": note}
 
 
+def spread_forecast(raw: pd.DataFrame, lookback: int = 20,
+                    horizon: int = 10) -> Optional[Dict]:
+    """Прогноз динамики спреда cash − 3M: куда движется напряжение рынка.
+
+    Спред — шумный краткосрочный ряд, поэтому прогноз простой и честный: тренд
+    (наклон линейной регрессии за lookback дней) с усадкой 0.5 на horizon дней
+    вперёд (спред склонен возвращаться к среднему). Расширение бэквордации = дефицит
+    нарастает (поддержка цены), сужение = напряжение спадает.
+
+    Возвращает {current, forecast, change, direction, tone, note} или None.
+    """
+    if "lme_cash" not in raw.columns or "lme_3m" not in raw.columns:
+        return None
+    sp = (raw["lme_cash"] - raw["lme_3m"]).dropna().tail(lookback)
+    if len(sp) < 5:
+        return None
+    x = np.arange(len(sp), dtype=float)
+    slope = float(np.polyfit(x, sp.values, 1)[0])   # USD/т в день
+    current = float(sp.iloc[-1])
+    forecast = current + slope * horizon * 0.5      # усадка тренда (mean-reversion)
+    change = forecast - current
+
+    if change > 5:
+        direction, tone = "к бэквордации", "wait"
+        note = "Спред растёт к дефициту — поддержка цены усиливается."
+    elif change < -5:
+        direction, tone = "к контанго", "ok"
+        note = "Спред уходит в контанго — давление дефицита спадает, профицит нарастает."
+    else:
+        direction, tone = "без динамики", "warn"
+        note = "Спред стабилен."
+
+    return {"current": current, "forecast": forecast, "change": change,
+            "horizon": horizon, "direction": direction, "tone": tone, "note": note}
+
+
 if __name__ == "__main__":
     import logging
     import datetime as dt
@@ -70,3 +107,4 @@ if __name__ == "__main__":
     start = (dt.date.today() - dt.timedelta(days=200)).strftime("%Y-%m-%d")
     raw = load_all(start=start, include_cot=False, include_fred=False)
     print(carry_signal(raw))
+    print(spread_forecast(raw))

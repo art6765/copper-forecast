@@ -129,15 +129,16 @@ def cached_forecast(_raw_signature: str, years: int,
 
 @st.cache_data(ttl=86400, show_spinner="Прогнозирую курс доллара…")
 def cached_usdrub_forecast(_raw_signature: str, years: int):
-    """Прогноз курса доллара ЦБ РФ (USD/RUB). Облегчён до GBM+ARIMA — для валюты
-    тяжёлые ML-модели (XGBoost/MLP) мало что дают, а старт сильно замедляют.
-    Результат кэшируется на диск, чтобы переживать перезапуск сервиса."""
+    """Прогноз курса доллара ЦБ РФ (USD/RUB) — ПОЛНЫЙ ансамбль (GBM+ARIMA+XGBoost+
+    MLP), методологически как у меди: ML улавливают связь курса с нефтью, DXY,
+    золотом — иначе прогноз получается почти плоским («прямая линия»). Скорость
+    держит диск-кэш + ночной прогрев (обучение раз в день, дальше с диска)."""
     disk = _disk_load("usdrub", _raw_signature)
     if disk is not None:
         return disk
     start = (dt.date.today() - dt.timedelta(days=years * 365 + 30)).strftime("%Y-%m-%d")
     raw = load_all(start=start)
-    payload = uf.forecast_usdrub(raw, use_xgb=False, use_mlp=False)
+    payload = uf.forecast_usdrub(raw)
     _disk_save("usdrub", _raw_signature, payload)
     return payload
 
@@ -491,7 +492,7 @@ except Exception:
 # Прогноз курса доллара (USD/RUB, ЦБ РФ) — для рублёвых цен в карточке,
 # ИИ-отчёта и прогнозного графика. Кэшируется (обучение моделей не дешёвое).
 try:
-    _sig_fx = f"{raw.index.max().date()}_{years}_usdrub"
+    _sig_fx = f"{raw.index.max().date()}_{years}_usdrub_full"
     usd_results = cached_usdrub_forecast(_sig_fx, years)
 except Exception:
     usd_results = {}
@@ -773,7 +774,8 @@ def render_buyer():
     except Exception:
         regime_label = "—"
 
-    alloc = recommend_allocation(v.key, regime_label, v.confidence, v.change_pct)
+    alloc = recommend_allocation(v.key, regime_label, v.confidence, v.change_pct,
+                                 prob_up=v.prob_up, band_pct=band)
     _acol = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[alloc["tone"]]
     st.markdown(f"""
 <div style='background:#F7F8FB;border-left:4px solid {_acol};border-radius:6px;
@@ -819,13 +821,22 @@ def render_buyer():
     cs = carry.carry_signal(raw)
     if cs:
         _cc = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[cs["tone"]]
+        sf = carry.spread_forecast(raw)
+        if sf:
+            _sc = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[sf["tone"]]
+            spread_line = (
+                f"<br><span style='color:#46535B'>Прогноз спреда (~{sf['horizon']} дн): "
+                f"<b style='color:{_sc}'>{sf['direction']}</b> "
+                f"({sf['current']:+.0f} → {sf['forecast']:+.0f} USD/т) — {sf['note']}</span>")
+        else:
+            spread_line = ""
         st.markdown(f"""
 <div style='font-size:13px;margin:2px 0 8px;padding:9px 14px;background:#FAFAFC;
             border-left:4px solid {_cc};border-radius:6px'>
   <b>Кривая LME: {cs['state']}</b>
   <span style='color:#7F8B93'>· спот {cs['cash']:,.0f} vs 3М {cs['m3']:,.0f} USD/т
   ({cs['spread']:+.0f} USD/т)</span>
-  <br><span style='color:#46535B'>{cs['note']}</span>
+  <br><span style='color:#46535B'>{cs['note']}</span>{spread_line}
 </div>
 """, unsafe_allow_html=True)
 
