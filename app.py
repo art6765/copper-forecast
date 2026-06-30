@@ -684,7 +684,7 @@ def render_buyer():
         main_price = f"{med_rub:,.0f}<span class='u'> ₽/т</span>"
         med_line = ("<div class='verdict-rub' style='font-size:16px;color:#001829;"
                     "font-weight:600;margin-top:2px'>"
-                    f"Медь: {med:,.0f}<span style='font-weight:400;color:#7F8B93'>"
+                    f"Медь (прогноз): {med:,.0f}<span style='font-weight:400;color:#7F8B93'>"
                     " USD/т</span></div>")
     else:
         main_price = f"{med:,.0f}<span class='u'> USD/т</span>"
