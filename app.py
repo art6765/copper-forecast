@@ -843,6 +843,69 @@ def render_buyer():
 </div>
 """, unsafe_allow_html=True)
 
+    # --- Планировщик закупки: прогноз → тонны, рубли, график траншей ---
+    with st.expander("📦 Планировщик закупки — перевести в тонны, рубли и график"):
+        import procurement as _proc
+        pc1, pc2 = st.columns(2)
+        need_m = pc1.number_input("Потребность, тонн/мес", min_value=1.0,
+                                  value=100.0, step=10.0, key="plan_need")
+        n_mo = int(pc2.slider("Срок планирования, мес", 1, 6, 3, key="plan_months"))
+
+        # Опорные точки прогноза по месяцам-вперёд (0 = сейчас + горизонты ≥10 дн)
+        _hd = {h["key"]: h["days"] for h in HORIZONS}
+        fx_eff = fx_now or 1.0
+        am, apr, alo, ahi, afx = [0.0], [spot_t], [spot_t], [spot_t], [fx_eff]
+        for hk in hz_avail:
+            d = _hd.get(hk, 0)
+            if d < 10:
+                continue
+            vv = verdicts[hk]
+            ff = (usd_results.get(hk) or {}).get("Ensemble") if usd_results else None
+            am.append(d / 21.0)
+            apr.append(vv.median_usd_t * _factor)
+            alo.append(vv.p10_usd_t * _factor)
+            ahi.append(vv.p90_usd_t * _factor)
+            afx.append(float(ff.point) if ff is not None else fx_eff)
+
+        plan = _proc.plan_purchase(need_m, n_mo, spot_t, fx_eff,
+                                   am, apr, alo, ahi, afx, alloc)
+        _cur = "₽" if fx_now else "USD"
+
+        pm1, pm2, pm3 = st.columns(3)
+        pm1.metric("Объём за период", f"{plan['total_t']:,.0f} т")
+        pm2.metric(f"Средняя цена, {_cur}/т", f"{plan['avg_price_rub_t']:,.0f}")
+        pm3.metric(f"Ожидаемая сумма, {_cur}",
+                   f"{plan['expected_rub']:,.0f}",
+                   help=f"Коридор {plan['low_rub']:,.0f} – {plan['high_rub']:,.0f} {_cur}")
+
+        # Экономия плана против двух базовых стратегий (положительная = выгода)
+        s_dca = plan["save_vs_dca_pct"]
+        s_now = plan["save_vs_now_pct"]
+        _sc = "#198754" if s_dca > 0.1 else "#E00613" if s_dca < -0.1 else "#7F8B93"
+        st.markdown(
+            f"<div style='font-size:13px;color:#46535B;margin:2px 0 8px'>"
+            f"План против «покупать равномерно»: "
+            f"<b style='color:{_sc}'>{plan['save_vs_dca_rub']:+,.0f} {_cur} "
+            f"({s_dca:+.1f}%)</b>; против «купить всё сейчас»: "
+            f"<b>{plan['save_vs_now_rub']:+,.0f} {_cur} ({s_now:+.1f}%)</b>."
+            f"</div>", unsafe_allow_html=True)
+
+        # График закупки: когда, сколько тонн, по какой цене, на какую сумму
+        _sch = pd.DataFrame(plan["schedule"])
+        _disp = pd.DataFrame({
+            "Когда": _sch["when"],
+            "Тонн": _sch["tonnes"].round(1),
+            "Цена, USD/т": _sch["price_usd_t"].round(0),
+            "Курс, ₽/$": _sch["fx"].round(2),
+            f"Сумма, {_cur}": _sch["cost_rub"].round(0),
+        })
+        st.dataframe(_disp, use_container_width=True, hide_index=True)
+        st.caption(
+            f"«Сейчас» берём {plan['now_t']:,.0f} т ({alloc['immediate_pct']}% "
+            f"от потребности), остальное — {plan['n_tranches']} траншами по "
+            f"прогнозной цене с учётом прогноза курса. Экономия — ожидаемая по "
+            "модели; реальную проверьте в Back-test → «Экономия стратегии».")
+
     # --- Из чего складывается рублёвый риск (Фаза G: медь × курс) ---
     if med_rub and fx_change is not None:
         r_med = v.change_pct
@@ -2712,6 +2775,81 @@ with tab_bt:
                              height=380, margin=dict(l=10, r=10, t=40, b=10),
                              yaxis_title="MAPE, %")
         st.plotly_chart(fig_bt, use_container_width=True)
+
+        # ============================================================
+        # Экономия стратегии закупщика: «следовать системе» vs «равномерно»
+        # ============================================================
+        st.markdown("---")
+        st.markdown("### 💰 Экономия стратегии закупщика")
+        st.caption(
+            "Денежная проверка пользы: если бы за исторический период закупщик "
+            "**следовал системе** (брал больше перед ожидаемым ростом, минимум "
+            "перед падением) против **покупок равномерно** — какова средняя цена "
+            "закупки и экономия. Веса берутся только из прогноза на дату решения "
+            "(без подглядывания в факт), цены — фактические.")
+        try:
+            import procurement as _proc
+            _ens = bt["predictions"].get("Ensemble", {})
+            if not _ens:
+                st.info("Нет ансамблевых прогнозов в back-test для оценки стратегии.")
+            else:
+                _Hs = sorted(_ens.keys())
+                _hlabel = {h["days"]: h["label"] for h in HORIZONS}
+                _hpick = st.selectbox(
+                    "Горизонт цикла закупки",
+                    _Hs, format_func=lambda d: _hlabel.get(d, f"{d} дн"),
+                    index=(_Hs.index(21) if 21 in _Hs else 0),
+                    help="Как часто принимается решение о закупке (горизонт прогноза).")
+                _usd = raw["usdrub"] if "usdrub" in raw.columns else None
+                _sr = _proc.backtest_strategy(_ens[_hpick], _usd)
+                if _sr is None:
+                    st.info("Недостаточно сверенных точек для оценки стратегии.")
+                else:
+                    _u = _sr["unit"]
+                    sm1, sm2, sm3 = st.columns(3)
+                    sm1.metric(f"Система, {_u}", f"{_sr.get('sys_rub_t', _sr['sys_usd_t']):,.0f}"
+                               if _sr["have_rub"] else f"{_sr['sys_usd_t']:,.0f}")
+                    sm2.metric(f"Равномерно, {_u}",
+                               f"{_sr.get('dca_rub_t', _sr['dca_usd_t']):,.0f}"
+                               if _sr["have_rub"] else f"{_sr['dca_usd_t']:,.0f}")
+                    sm3.metric("Экономия", f"{_sr['save_pct']:+.2f}%",
+                               help="Положительная — система покупала в среднем дешевле.")
+                    # Денежный эффект на потребность
+                    _need = st.number_input(
+                        "Перевести в деньги: потребность за период, тонн",
+                        min_value=1.0, value=1000.0, step=100.0, key="strat_need")
+                    if _sr["have_rub"]:
+                        _save_money = _sr["save_rub_t"] * _need
+                        st.markdown(
+                            f"На объём **{_need:,.0f} т** за период "
+                            f"({_sr['first']} … {_sr['last']}, {_sr['n']} решений) "
+                            f"экономия ≈ **{_save_money:,.0f} ₽** "
+                            f"({_sr['save_rub_t']:+,.0f} ₽/т).")
+                    else:
+                        _save_money = _sr["save_usd_t"] * _need
+                        st.markdown(
+                            f"На объём **{_need:,.0f} т** экономия ≈ "
+                            f"**{_save_money:,.0f} USD** ({_sr['save_usd_t']:+,.0f} USD/т). "
+                            "Курс ЦБ недоступен — расчёт в долларах.")
+                    # График накопленной средней цены закупки во времени
+                    _cv = _sr["curve"]
+                    fig_s = go.Figure()
+                    fig_s.add_trace(go.Scatter(x=_cv.index, y=_cv["system"],
+                                    name="Система", line=dict(color="#198754", width=2)))
+                    fig_s.add_trace(go.Scatter(x=_cv.index, y=_cv["uniform"],
+                                    name="Равномерно", line=dict(color="#001829",
+                                    width=2, dash="dash")))
+                    fig_s.update_layout(
+                        height=340, margin=dict(l=10, r=10, t=40, b=10),
+                        title=f"Накопленная средняя цена закупки ({_u})",
+                        yaxis_title=_u, legend=dict(orientation="h", yanchor="bottom",
+                        y=1.02, xanchor="right", x=1))
+                    st.plotly_chart(fig_s, use_container_width=True)
+                    st.caption("Зелёная ниже пунктирной — система покупала дешевле "
+                               "равномерной закупки. Эффект тем больше, чем точнее "
+                               "модель ловит направление цены.")
+        except Exception as _exc:
+            st.warning(f"Не удалось оценить стратегию: {_exc}")
 
         # ============================================================
         # Detail: «Прогноз vs Факт» — на правильной календарной шкале
