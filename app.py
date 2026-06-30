@@ -678,15 +678,17 @@ def render_buyer():
     med_rub = med * fx_fore if fx_fore else None            # прогнозная цена меди, ₽/т
     fx_change = ((fx_fore / fx_now - 1) * 100) if (fx_fore and fx_now) else None
 
-    # Строка рублёвой цены меди (если курс доступен)
+    # Главная цена — крупно в рублях (если курс доступен), иначе в долларах.
+    # Прогноз меди в долларах уходит отдельной строкой ниже.
     if med_rub:
-        rub_line = (
-            "<div class='verdict-rub' style='font-size:18px;color:#001829;"
-            "font-weight:700;margin-top:2px'>"
-            f"≈ {med_rub:,.0f}<span style='font-weight:400;color:#7F8B93'> ₽/т</span>"
-            "</div>")
+        main_price = f"{med_rub:,.0f}<span class='u'> ₽/т</span>"
+        med_line = ("<div class='verdict-rub' style='font-size:16px;color:#001829;"
+                    "font-weight:600;margin-top:2px'>"
+                    f"Медь: {med:,.0f}<span style='font-weight:400;color:#7F8B93'>"
+                    " USD/т</span></div>")
     else:
-        rub_line = ""
+        main_price = f"{med:,.0f}<span class='u'> USD/т</span>"
+        med_line = ""
     # Строка прогнозного курса доллара (рост курса = рубль слабее = дороже закупка → красный)
     if fx_fore:
         if fx_change is not None and abs(fx_change) >= 0.1:
@@ -717,9 +719,9 @@ def render_buyer():
   <div class='rail' style='background:{v.color}'></div>
   <div style='padding-left:14px'>
     <div class='verdict-eyebrow'>Цель на {v.horizon_label.lower()} · {sub_label}</div>
-    <div class='verdict-price'>{med:,.0f}<span class='u'> USD/т</span></div>
-    {rub_line}
+    <div class='verdict-price'>{main_price}</div>
     {fx_line}
+    {med_line}
     <div class='verdict-rub' style='opacity:.7;margin-top:2px'>Коридор {p10:,.0f} – {p90:,.0f} USD/т</div>
     <div class='verdict-tag' style='background:{tone_bg};color:{v.color}'>
       <span style='font-size:24px'>{v.icon}</span> {v.label}
