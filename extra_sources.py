@@ -574,6 +574,153 @@ def fetch_cbr_usdrub(start: str = "2020-01-01", refresh: bool = False) -> pd.Dat
     return df_new
 
 
+# ---------------------------------------------------------------------------
+#  Ключевая ставка ЦБ РФ — сильнейший фундаментальный драйвер рубля (carry).
+# ---------------------------------------------------------------------------
+CBR_SOAP_URL = "https://www.cbr.ru/DailyInfoWebServ/DailyInfo.asmx"
+
+# Статический фолбэк — публичная история решений Совета директоров ЦБ по
+# ключевой ставке (дата вступления в силу → ставка, % годовых). Используется,
+# если SOAP-сервис недоступен и нет кэша. ОБНОВЛЯТЬ ВРУЧНУЮ при новом решении
+# ЦБ (как премию Яншань в china.py): добавить строку с датой и новой ставкой.
+# SOAP-фетч обычно подтягивает свежие значения сам — это лишь страховка офлайн.
+KEY_RATE_SCHEDULE: Dict[str, float] = {
+    "2020-04-27": 5.50, "2020-06-22": 4.50, "2020-07-27": 4.25,
+    "2021-03-22": 4.50, "2021-04-26": 5.00, "2021-06-15": 5.50,
+    "2021-07-26": 6.50, "2021-09-13": 6.75, "2021-10-25": 7.50,
+    "2021-12-20": 8.50, "2022-02-14": 9.50, "2022-02-28": 20.00,
+    "2022-04-11": 17.00, "2022-05-04": 14.00, "2022-05-27": 11.00,
+    "2022-06-14": 9.50, "2022-07-25": 8.00, "2022-09-19": 7.50,
+    "2023-07-24": 8.50, "2023-08-15": 12.00, "2023-09-18": 13.00,
+    "2023-10-30": 15.00, "2023-12-18": 16.00, "2024-07-29": 18.00,
+    "2024-09-16": 19.00, "2024-10-28": 21.00,
+}
+
+
+def _key_rate_from_schedule(start: str) -> pd.DataFrame:
+    """Дневной ряд ключевой ставки из статического расписания (ступенька,
+    forward-fill). Покрывает диапазон start → сегодня."""
+    if not KEY_RATE_SCHEDULE:
+        return pd.DataFrame(columns=["cbr_key_rate"])
+    s = pd.Series(KEY_RATE_SCHEDULE)
+    s.index = pd.to_datetime(s.index)
+    s = s.sort_index()
+    idx = pd.date_range(start=min(s.index.min(), pd.Timestamp(start)),
+                        end=pd.Timestamp(dt.date.today()), freq="D")
+    daily = s.reindex(idx).ffill()
+    out = pd.DataFrame({"cbr_key_rate": daily})
+    out.index.name = "date"
+    return out.loc[pd.Timestamp(start):].dropna()
+
+
+def _post(url: str, body: bytes, headers: Dict[str, str],
+          timeout: int = 25) -> bytes:
+    """HTTP POST через urllib (TLSv1.2+) с fallback на curl. Для SOAP-запросов."""
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        req = Request(url, data=body, headers=headers, method="POST")
+        with urlopen(req, context=ctx, timeout=timeout) as r:
+            return r.read()
+    except Exception as exc:
+        logger.debug("POST urllib failed (%s) — пробую curl", exc)
+        hdr_args = []
+        for k, v in headers.items():
+            hdr_args += ["-H", f"{k}: {v}"]
+        result = subprocess.run(
+            ["curl", "-sSL", "--max-time", str(timeout), "-X", "POST",
+             *hdr_args, "--data-binary", body.decode("utf-8"), url],
+            capture_output=True, check=True, timeout=timeout + 5,
+        )
+        return result.stdout
+
+
+def _fetch_key_rate_soap(start: str) -> pd.DataFrame:
+    """История ключевой ставки через SOAP-сервис ЦБ (DailyInfo.KeyRate).
+    Возвращает DataFrame index=date, колонка cbr_key_rate. Пустой при сбое."""
+    from_iso = dt.datetime.strptime(start, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
+    to_iso = dt.date.today().strftime("%Y-%m-%dT00:00:00")
+    envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+        '<soap:Body><KeyRate xmlns="http://web.cbr.ru/">'
+        f'<fromDate>{from_iso}</fromDate><ToDate>{to_iso}</ToDate>'
+        '</KeyRate></soap:Body></soap:Envelope>'
+    ).encode("utf-8")
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": "http://web.cbr.ru/KeyRate",
+        "User-Agent": "Mozilla/5.0",
+    }
+    raw = _post(CBR_SOAP_URL, envelope, headers, timeout=25)
+    text = raw.decode("utf-8", errors="replace")
+    # Записи вида <KR ...><DT>2024-10-28T00:00:00+03:00</DT><Rate>21</Rate></KR>
+    pairs = re.findall(r"<DT>([^<]+)</DT>\s*<Rate>([^<]+)</Rate>", text)
+    if not pairs:
+        return pd.DataFrame(columns=["cbr_key_rate"])
+    dates, rates = [], []
+    for d, r in pairs:
+        try:
+            rates.append(float(r.replace(",", ".").strip()))
+            dates.append(pd.to_datetime(d[:10]))
+        except Exception:
+            continue
+    if not dates:
+        return pd.DataFrame(columns=["cbr_key_rate"])
+    s = (pd.Series(rates, index=pd.DatetimeIndex(dates, name="date"))
+         .sort_index())
+    s = s[~s.index.duplicated(keep="last")]
+    # Разворачиваем редкие точки решений в ежедневный ряд (ступенька)
+    idx = pd.date_range(s.index.min(), pd.Timestamp(dt.date.today()), freq="D")
+    return pd.DataFrame({"cbr_key_rate": s.reindex(idx).ffill()}).dropna()
+
+
+def fetch_cbr_key_rate(start: str = "2020-01-01",
+                       refresh: bool = False) -> pd.DataFrame:
+    """История ключевой ставки ЦБ РФ (% годовых), ежедневный ряд.
+
+    Источник: SOAP-сервис ЦБ (DailyInfo.KeyRate, бесплатно, без ключа). Кэш —
+    data/cache_cbr_key_rate.csv, накапливается. Фолбэк при сбое сети: старый кэш,
+    а если и его нет — статическое расписание KEY_RATE_SCHEDULE. Так драйвер
+    рубля доступен всегда, даже офлайн.
+    """
+    cache_path = DATA_DIR / "cache_cbr_key_rate.csv"
+    cached = None
+    if cache_path.exists():
+        try:
+            cached = (pd.read_csv(cache_path, parse_dates=["date"])
+                        .set_index("date").sort_index())
+            if not refresh and cached.index.max() >= (
+                    pd.Timestamp(dt.date.today()) - pd.Timedelta(days=2)):
+                return cached
+        except Exception:
+            cached = None
+
+    try:
+        df_new = _fetch_key_rate_soap(start)
+    except Exception as exc:
+        logger.warning("ЦБ РФ ключевая ставка fetch failed: %s", exc)
+        df_new = pd.DataFrame(columns=["cbr_key_rate"])
+
+    if df_new.empty:
+        if cached is not None and not cached.empty:
+            return cached
+        logger.info("Ключевая ставка ЦБ: SOAP недоступен → статическое расписание")
+        return _key_rate_from_schedule(start)
+
+    if cached is not None and not cached.empty:
+        merged = pd.concat([cached, df_new])
+        df_new = merged[~merged.index.duplicated(keep="last")].sort_index()
+
+    df_new.to_csv(cache_path, index_label="date")
+    logger.info("ЦБ РФ ключевая ставка: %d строк, последняя %.2f%% на %s",
+                len(df_new), float(df_new["cbr_key_rate"].iloc[-1]),
+                df_new.index.max().date())
+    return df_new
+
+
 def fetch_cbr_usdrub_latest() -> Optional[Dict]:
     """Актуальный курс USD/RUB через cbr-xml-daily.ru (JSON, точка-десятич.).
 

@@ -27,7 +27,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data_loader import load_all, LB_PER_TON
-from features import describe_feature
+from features import describe_feature, FEATURE_VERSION
 from models import (
     forecast_all_horizons, forecasts_to_dataframe, HORIZONS,
     ensemble_forecast, forecast_at_point, actuals_after_point,
@@ -467,7 +467,7 @@ if historical_mode:
              "фактическое продолжение цены — справа.",
     )
     sig = (f"{raw.index.max().date()}_{len(raw)}_{years}_"
-            f"{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}_AT_{as_of_choice}")
+            f"{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}_{FEATURE_VERSION}_AT_{as_of_choice}")
     (raw, results, df_fc, historical_actuals,
      historical_as_of, xgb_explanations) = cached_forecast_at_point(
         sig, years, as_of_choice.isoformat(),
@@ -480,7 +480,7 @@ if historical_mode:
             f"**{historical_as_of.date()}**."
         )
 else:
-    sig = f"{raw.index.max().date()}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}"
+    sig = f"{raw.index.max().date()}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}_{FEATURE_VERSION}"
     raw, results, df_fc, xgb_explanations = cached_forecast(
         sig, years, use_xgb, use_mlp, use_arima, use_gbm
     )
@@ -502,7 +502,7 @@ except Exception:
 # Прогноз курса доллара (USD/RUB, ЦБ РФ) — для рублёвых цен в карточке,
 # ИИ-отчёта и прогнозного графика. Кэшируется (обучение моделей не дешёвое).
 try:
-    _sig_fx = f"{raw.index.max().date()}_{years}_usdrub_full"
+    _sig_fx = f"{raw.index.max().date()}_{years}_usdrub_full_{FEATURE_VERSION}"
     usd_results = cached_usdrub_forecast(_sig_fx, years)
 except Exception:
     usd_results = {}
@@ -510,10 +510,17 @@ usd_current = uf.current_usdrub(raw)
 
 if not historical_mode:
     try:
+        # Прогноз курса в журнал точности (market='USDRUB') — чтобы измерять
+        # качество USD-модели так же, как меди/LME. Колонки стандартные
+        # (forecasts_to_dataframe), значения — ₽/$; резолв по raw["usdrub"].
+        _usd_df = (forecasts_to_dataframe(usd_results)
+                   if usd_results else None)
         _jr = history_db.record_live_forecast(
             df_fc, as_of_date=raw.index.max(), price_series=raw["copper"],
             lme_df=(lme_direct_df if not lme_direct_df.empty else None),
             lme_series=(raw["lme_3m"] if "lme_3m" in raw.columns else None),
+            usd_df=_usd_df,
+            usd_series=(raw["usdrub"] if "usdrub" in raw.columns else None),
         )
         if _jr.get("logged") or _jr.get("resolved"):
             logging.info("Журнал прогнозов: +%d записано, %d сверено с фактом",
@@ -790,6 +797,17 @@ def render_buyer():
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+    # Честная оговорка про официальный курс ЦБ: с 2022 он управляемый и сглаженный
+    # (после санкций на Мосбиржу в 2024 биржевых торгов USD нет, курс считается по
+    # отчётности банков), может отставать от рыночного, а вокруг политических
+    # шоков точность любой модели курса низкая. Показываем, когда курс участвует.
+    if fx_fore:
+        st.caption(
+            "⚠️ Курс USD/RUB — официальный курс ЦБ РФ: с 2022 он управляемый и "
+            "сглаженный (биржевых торгов долларом нет с 2024), может отставать от "
+            "рыночного. Вокруг политических/санкционных шоков точность прогноза "
+            "курса заметно ниже, чем в спокойные периоды.")
 
     # --- Метрики сравнения ---
     m1, m2, m3 = st.columns(3)
@@ -2843,11 +2861,15 @@ with tab_accuracy:
                 "наполните его из back-test в блоке выше."
             )
         else:
-            _mkt = st.radio("Рынок", ["COMEX", "LME"], horizontal=True,
+            _mkt = st.radio("Рынок", ["COMEX", "LME", "USDRUB"], horizontal=True,
                             key="acc_market",
-                            help="COMEX (HG=F, USD/lb) или LME 3M (USD/т). Метрики "
-                                 "LME копятся по мере дозревания LME-модели.")
-            _to_t = 1.0 if _mkt == "LME" else LB_PER_TON   # перевод цены в USD/т
+                            help="COMEX (HG=F, USD/lb), LME 3M (USD/т) или курс "
+                                 "доллара USDRUB (₽/$). Метрики курса и LME копятся "
+                                 "по мере наступления целевых дат.")
+            # Перевод цены в отображаемые единицы: медь COMEX → USD/т (×LB_PER_TON),
+            # LME уже USD/т, курс уже в ₽ — для них множитель 1.
+            _to_t = LB_PER_TON if _mkt == "COMEX" else 1.0
+            _unit_acc = "₽" if _mkt == "USDRUB" else "USD/т"
             _log_all = history_db.load_log(resolved_only=True, market=_mkt)
             models_avail = (sorted(_log_all["model"].dropna().unique().tolist())
                             if not _log_all.empty else [])
@@ -2869,8 +2891,9 @@ with tab_accuracy:
                     st.info("Недостаточно данных для сводки.")
                 else:
                     disp = summ.copy()
-                    disp["MAE, USD/т"] = (disp["mae"] * _to_t).round(0)
-                    disp["Bias, USD/т"] = (disp["bias"] * _to_t).round(0)
+                    _mae_col, _bias_col = f"MAE, {_unit_acc}", f"Bias, {_unit_acc}"
+                    disp[_mae_col] = (disp["mae"] * _to_t).round(0)
+                    disp[_bias_col] = (disp["bias"] * _to_t).round(0)
                     disp = disp.rename(columns={
                         "model": "Модель", "horizon_label": "Горизонт", "n": "N",
                         "hit_rate": "Hit Rate, %", "coverage80": "Coverage80, %",
@@ -2880,7 +2903,7 @@ with tab_accuracy:
                     disp["Coverage80, %"] = disp["Coverage80, %"].round(1)
                     disp["MAPE, %"] = disp["MAPE, %"].round(2)
                     cols = ["Модель", "Горизонт", "N", "Hit Rate, %",
-                            "Coverage80, %", "MAPE, %", "MAE, USD/т", "Bias, USD/т"]
+                            "Coverage80, %", "MAPE, %", _mae_col, _bias_col]
                     st.dataframe(disp[cols], use_container_width=True, hide_index=True)
 
                     msel = st.selectbox(

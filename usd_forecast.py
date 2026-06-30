@@ -26,6 +26,15 @@ from models import forecast_all_horizons, forecasts_to_dataframe, HORIZONS
 # Минимум дневных точек для осмысленного прогноза курса.
 MIN_DAYS = 60
 
+# Окно обучения модели курса под ТЕКУЩИЙ монетарный режим рубля. С 2022 курс
+# пережил структурные сломы (капитальный контроль, обязательная продажа валюты
+# экспортёрами, шок февраля-2022 с пиком 120+ и откатом). Обучать на всём ряду —
+# значит смешивать несовместимые режимы и завышать волатильность. Поэтому по
+# умолчанию берём последние ~3 года: это отсекает шок 2022 и оставляет данные
+# действующего управляемого режима. Если истории меньше — используем всё.
+RECENCY_YEARS = 3.0
+MIN_RECENCY_DAYS = 380   # не сужаем агрессивнее, чем до ~1.5 лет
+
 # Переименование ценовых колонок forecasts_to_dataframe в рублёвые подписи.
 _RUB_RENAME = {
     "P0, USD/lb": "P0, ₽", "Точечный": "Точечный, ₽", "Медиана": "Медиана, ₽",
@@ -58,11 +67,15 @@ def data_status(raw: pd.DataFrame) -> Dict:
     }
 
 
-def _usdrub_as_raw(raw: pd.DataFrame) -> pd.DataFrame:
+def _usdrub_as_raw(raw: pd.DataFrame,
+                   recency_years: float = RECENCY_YEARS) -> pd.DataFrame:
     """Копия raw с целевым рядом = USD/RUB вместо меди, выровненная по датам
     курса. Позволяет переиспользовать build_features / forecast_all_horizons.
-    Кросс-факторы (DXY, нефть, золото, S&P) релевантны рублю и остаются как фичи.
-    Медные OHLC/объём убираем — к курсу не относятся (ATR-фичи выпадут штатно).
+    Кросс-факторы (DXY, Brent, нефть, золото, ставка ЦБ, carry) релевантны рублю
+    и остаются как фичи. Медные OHLC/объём убираем — к курсу не относятся.
+
+    Окно обучения сужается до последних recency_years лет (режимная очистка —
+    см. RECENCY_YEARS), но не агрессивнее MIN_RECENCY_DAYS точек.
     """
     fx = usdrub_series(raw)
     sub = raw.reindex(fx.index).copy()
@@ -70,11 +83,19 @@ def _usdrub_as_raw(raw: pd.DataFrame) -> pd.DataFrame:
     for col in ["copper_high", "copper_low", "copper_volume"]:
         if col in sub.columns:
             sub = sub.drop(columns=col)
+    # Режимное окно: оставляем только последние recency_years лет,
+    # если данных заметно больше (иначе теряем выборку для длинных горизонтов).
+    if recency_years and len(sub) > MIN_RECENCY_DAYS:
+        cutoff = sub.index.max() - pd.Timedelta(days=int(recency_years * 365))
+        trimmed = sub.loc[sub.index >= cutoff]
+        if len(trimmed) >= MIN_RECENCY_DAYS:
+            sub = trimmed
     return sub
 
 
 def forecast_usdrub(raw: pd.DataFrame, use_xgb: bool = True, use_mlp: bool = True,
-                    use_arima: bool = True, use_gbm: bool = True
+                    use_arima: bool = True, use_gbm: bool = True,
+                    recency_years: float = RECENCY_YEARS
                     ) -> Dict[str, Dict]:
     """Прогноз курса USD/RUB по всем горизонтам из HORIZONS.
 
@@ -87,7 +108,7 @@ def forecast_usdrub(raw: pd.DataFrame, use_xgb: bool = True, use_mlp: bool = Tru
     if len(fx) < MIN_DAYS:
         return {}
     try:
-        sub = _usdrub_as_raw(raw)
+        sub = _usdrub_as_raw(raw, recency_years=recency_years)
         return forecast_all_horizons(
             sub, use_xgb=use_xgb, use_mlp=use_mlp,
             use_arima=use_arima, use_gbm=use_gbm,

@@ -22,11 +22,16 @@ import pandas as pd
 
 
 LAGS_RET = [1, 2, 3, 5, 10, 20, 60]
+# Версия набора фич. Подмешивается в сигнатуры диск-кэша прогнозов (app.py,
+# forecast.py): при изменении состава признаков — БУМП этой строки, иначе кэш
+# вернёт устаревший прогноз, построенный на старом наборе фич.
+FEATURE_VERSION = "f2"   # f2: + Brent, ключевая ставка ЦБ, carry
+
 LAGS_PRICE = [1, 5, 20]
 SMA_WINDOWS = [5, 10, 20, 60]
 VOL_WINDOWS = [10, 20, 60]
 CROSS_ASSETS = [
-    "dxy", "wti", "gold", "silver", "sp500", "us10y",
+    "dxy", "wti", "brent", "gold", "silver", "sp500", "us10y",
     "audusd", "usdclp", "usdcny",      # валюты горнодобыч. стран
     "copx", "pick", "slx",              # mining ETFs
     "vix", "bdry",                      # риск + логистика
@@ -39,6 +44,7 @@ CROSS_ASSETS = [
 ASSET_LABELS = {
     "dxy":    "доллар (DXY)",
     "wti":    "нефть WTI",
+    "brent":  "нефть Brent",
     "gold":   "золото",
     "silver": "серебро",
     "sp500":  "S&P 500",
@@ -88,6 +94,11 @@ def describe_feature(name: str) -> str:
         "lme_stock_total": "Складские запасы меди на LME, тонн",
         "lme_stock_log": "Логарифм складских запасов LME",
         "lme_stock_pct_change": "Дневное изменение запасов LME, %",
+        "cbr_key_rate": "Ключевая ставка ЦБ РФ, % годовых — драйвер рубля",
+        "cbr_key_rate_chg_60d": "Изменение ключевой ставки ЦБ за 60 дней, п.п.",
+        "cbr_key_rate_chg_120d": "Изменение ключевой ставки ЦБ за 120 дней, п.п.",
+        "carry_rub_usd": "Carry: дифференциал ставок ЦБ РФ − ФРС, п.п. (главный фундаментал FX)",
+        "carry_rub_usd_chg_60d": "Изменение carry (ставка ЦБ − ФРС) за 60 дней, п.п.",
     }
     if name in exact:
         return exact[name]
@@ -331,6 +342,20 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
                 out[f"{col}_yoy"] = v.pct_change(252) * 100
             else:
                 out[f"{col}_chg_20d"] = v.diff(20)
+
+    # ---- Доп. фичи: ключевая ставка ЦБ РФ + carry (драйверы рубля) ----
+    # Ставка — это уровень в % годовых, поэтому НЕ обрабатываем её как ценовой
+    # ряд (лог-доходность ставки бессмысленна): берём уровень и его изменение.
+    # carry = дифференциал ставок (ЦБ РФ − ФРС) — главный фундаментал для FX.
+    if "cbr_key_rate" in df.columns:
+        kr = df["cbr_key_rate"]
+        out["cbr_key_rate"] = kr
+        out["cbr_key_rate_chg_60d"] = kr.diff(60)
+        out["cbr_key_rate_chg_120d"] = kr.diff(120)
+        if "fred_fedfunds" in df.columns:
+            carry = kr - df["fred_fedfunds"]
+            out["carry_rub_usd"] = carry
+            out["carry_rub_usd_chg_60d"] = carry.diff(60)
 
     return out
 

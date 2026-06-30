@@ -143,6 +143,7 @@ def _warm_dashboard_cache(raw, results, df_fc, xgb_models, xgb_x_now, years,
     она совпадёт с дефолтом дашборда. При иных настройках дашборд переобучит сам."""
     import pickle
     import usd_forecast as uf
+    from features import FEATURE_VERSION
 
     data_dir = Path(__file__).resolve().parent / "data"
     data_dir.mkdir(exist_ok=True)
@@ -158,14 +159,14 @@ def _warm_dashboard_cache(raw, results, df_fc, xgb_models, xgb_x_now, years,
             except Exception:
                 pass
 
-    sig_med = f"{last}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}"
+    sig_med = f"{last}_{len(raw)}_{years}_{use_xgb}_{use_mlp}_{use_arima}_{use_gbm}_{FEATURE_VERSION}"
     (data_dir / "state_forecast.pkl").write_bytes(
         pickle.dumps({"sig": sig_med,
                       "payload": (raw, results, df_fc, explanations)}))
 
-    # Курс — облегчённый GBM+ARIMA, как в app.cached_usdrub_forecast
+    # Курс — полный ансамбль, как в app.cached_usdrub_forecast
     usd_results = uf.forecast_usdrub(raw)
-    sig_fx = f"{last}_{years}_usdrub_full"
+    sig_fx = f"{last}_{years}_usdrub_full_{FEATURE_VERSION}"
     (data_dir / "state_usdrub.pkl").write_bytes(
         pickle.dumps({"sig": sig_fx, "payload": usd_results}))
     logger.info("Прогрет диск-кэш дашборда (state_forecast.pkl + state_usdrub.pkl)")
@@ -238,8 +239,20 @@ def main(argv=None):
     # горизонтов с фактом. Идемпотентно (1 запись на дату×модель×горизонт).
     try:
         import history_db
+        import usd_forecast as uf
+        # Прогноз курса доллара — тоже в журнал точности (market='USDRUB'),
+        # чтобы ночью измерять качество USD-модели наравне с медью.
+        usd_df = None
+        if "usdrub" in raw.columns:
+            try:
+                usd_results = uf.forecast_usdrub(raw)
+                usd_df = forecasts_to_dataframe(usd_results) if usd_results else None
+            except Exception as exc:
+                logger.warning("Прогноз курса для журнала не построен: %s", exc)
         jr = history_db.record_live_forecast(
-            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"]
+            df_fc, as_of_date=raw.index.max(), price_series=raw["copper"],
+            usd_df=usd_df,
+            usd_series=(raw["usdrub"] if "usdrub" in raw.columns else None),
         )
         logger.info("Журнал прогнозов: +%d записано, %d сверено с фактом",
                     jr.get("logged", 0), jr.get("resolved", 0))

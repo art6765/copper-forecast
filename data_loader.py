@@ -34,6 +34,7 @@ TICKERS: Dict[str, str] = {
     "HG=F":    "copper",      # COMEX Copper, USD/lb  (целевой ряд)
     "DX-Y.NYB": "dxy",        # US Dollar Index
     "CL=F":    "wti",         # WTI Crude
+    "BZ=F":    "brent",       # Brent Crude — главный драйвер рубля
     "GC=F":    "gold",        # Gold
     "SI=F":    "silver",      # Silver
     "^GSPC":   "sp500",       # S&P 500
@@ -187,12 +188,13 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
                                         fetch_lme_stocks_westmetall,
                                         fetch_lme_copper_price,
                                         fetch_fred_bundle,
-                                        fetch_cbr_usdrub)
+                                        fetch_cbr_usdrub,
+                                        fetch_cbr_key_rate)
         except ImportError as exc:
             logger.warning("extra_sources недоступен: %s", exc)
             fetch_cftc_cot = fetch_lme_stocks_westmetall = None
             fetch_lme_copper_price = fetch_fred_bundle = None
-            fetch_cbr_usdrub = None
+            fetch_cbr_usdrub = fetch_cbr_key_rate = None
 
         if include_cot and fetch_cftc_cot is not None:
             try:
@@ -267,6 +269,18 @@ def load_all(start: str = "2020-01-01", refresh: bool = False,
                                 float(fx["usdrub"].iloc[-1]))
             except Exception as exc:
                 logger.warning("ЦБ РФ USD/RUB не загружен: %s", exc)
+
+        # ---------- Ключевая ставка ЦБ РФ — драйвер рубля (carry) ----------
+        if include_cbr and fetch_cbr_key_rate is not None:
+            try:
+                kr = fetch_cbr_key_rate(start=start, refresh=refresh)
+                if not kr.empty:
+                    kr_d = kr.reindex(out.index, method="ffill")
+                    out["cbr_key_rate"] = kr_d["cbr_key_rate"]
+                    logger.info("ЦБ РФ ключевая ставка добавлена: последняя %.2f%%",
+                                float(kr["cbr_key_rate"].iloc[-1]))
+            except Exception as exc:
+                logger.warning("ЦБ РФ ключевая ставка не загружена: %s", exc)
 
     return out
 

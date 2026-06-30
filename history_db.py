@@ -536,13 +536,17 @@ def clear(conn: Optional[sqlite3.Connection] = None,
 def record_live_forecast(df_fc: pd.DataFrame, as_of_date, price_series: pd.Series,
                          path: Optional[Path] = None,
                          lme_df: Optional[pd.DataFrame] = None,
-                         lme_series: Optional[pd.Series] = None) -> Dict[str, int]:
+                         lme_series: Optional[pd.Series] = None,
+                         usd_df: Optional[pd.DataFrame] = None,
+                         usd_series: Optional[pd.Series] = None) -> Dict[str, int]:
     """Один вызов из app.py: записать текущий прогноз(ы) и разрешить наступившие.
 
     COMEX-прогноз (df_fc) пишется с market='COMEX' и резолвится по price_series
     (raw["copper"], USD/lb). Если переданы lme_df (forecast_lme_direct) и
     lme_series (raw["lme_3m"], USD/т) — дополнительно пишется LME-прогноз
-    (market='LME') с резолвом по lme_series. Запись идемпотентна.
+    (market='LME') с резолвом по lme_series. Если переданы usd_df (прогноз курса
+    из forecasts_to_dataframe) и usd_series (raw["usdrub"], ₽/$) — пишется прогноз
+    курса (market='USDRUB') с резолвом по usd_series. Запись идемпотентна.
     """
     conn = connect(path)
     try:
@@ -555,6 +559,12 @@ def record_live_forecast(df_fc: pd.DataFrame, as_of_date, price_series: pd.Serie
                 logged += log_forecast(lme_df, ls.index[-1], source="live",
                                        market="LME", conn=conn)
                 resolved += resolve_due(ls, market="LME", conn=conn)
+        if usd_df is not None and not usd_df.empty and usd_series is not None:
+            us = usd_series.dropna()
+            if len(us):
+                logged += log_forecast(usd_df, us.index[-1], source="live",
+                                       market="USDRUB", conn=conn)
+                resolved += resolve_due(us, market="USDRUB", conn=conn)
         return {"logged": logged, "resolved": resolved}
     finally:
         conn.close()
