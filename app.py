@@ -960,10 +960,12 @@ def render_buyer():
 
     # --- Действия: ИИ-отчёт и прогнозный график (Фазы E, F) ---
     st.markdown("##### 🧰 Действия")
-    act1, act2 = st.columns(2)
-    gen_report = act1.button("📝 Сформировать отчёт", use_container_width=True,
-                             help="ИИ простыми словами объяснит, почему такой прогноз")
-    gen_chart = act2.button("📈 Показать графики", use_container_width=True,
+    act1, act2, act3 = st.columns(3)
+    gen_report = act1.button("📝 Отчёт по меди", use_container_width=True,
+                             help="ИИ простыми словами объяснит прогноз цены меди")
+    gen_usd_report = act2.button("💱 Отчёт по доллару", use_container_width=True,
+                                 help="ИИ простыми словами объяснит прогноз курса рубля")
+    gen_chart = act3.button("📈 Показать графики", use_container_width=True,
                             help="Прогнозные кривые: отдельно медь и отдельно курс рубля")
 
     if gen_report:
@@ -1002,10 +1004,55 @@ def render_buyer():
                 st.error(f"Не удалось сформировать отчёт: {exc}")
 
     if st.session_state.get("buyer_report"):
-        st.markdown("#### 📝 Отчёт по прогнозу")
+        st.markdown("#### 📝 Отчёт по прогнозу меди")
         st.markdown(st.session_state["buyer_report"])
         st.caption(f"Сформировано ИИ · {st.session_state.get('buyer_report_meta', '')}. "
                    "Не является инвестиционной рекомендацией.")
+
+    # --- ИИ-отчёт по курсу доллара (аналог отчёта по меди, фокус на рубле) ---
+    if gen_usd_report:
+        import usd_report as ur
+        if not usd_results:
+            st.warning("Отчёт по доллару недоступен: прогноз курса не построен "
+                       "(нет данных ЦБ РФ).")
+        elif not ur.has_api_key():
+            st.warning("ИИ-отчёт недоступен: не задан ключ DEEPSEEK_API_KEY (.env). "
+                       "Базовое объяснение курса — в блоке «Кривая LME» и сноске выше.")
+        else:
+            # Прогноз курса по всем горизонтам (точка + коридор + изменение)
+            usd_all = []
+            for hk in hz_avail:
+                ff = (usd_results.get(hk) or {}).get("Ensemble")
+                if ff is None:
+                    continue
+                ch = ((ff.point / fx_now - 1) * 100) if fx_now else None
+                usd_all.append({"label": verdicts[hk].horizon_label,
+                                "fx_fore": float(ff.point), "change_pct": ch,
+                                "p10": float(ff.p10), "p90": float(ff.p90)})
+            uctx = {
+                "as_of": str(raw.index.max().date()),
+                "current_usdrub": fx_now, "regime": regime_label,
+                "horizon_label": v.horizon_label, "horizon_sub": sub_label,
+                "fx_fore": fx_fore, "fx_change": (fx_change or 0.0),
+                "fx_p10": float(fx_fc.p10) if fx_fc is not None else fx_fore,
+                "fx_p90": float(fx_fc.p90) if fx_fc is not None else fx_fore,
+                "fx_prob_up": (fx_fc.prob_up * 100) if fx_fc is not None else 50.0,
+                "med_rub_change": fx_change,
+                "drivers": ur.usd_drivers(raw), "all_horizons": usd_all,
+            }
+            try:
+                with st.spinner("ИИ готовит отчёт по доллару…"):
+                    st.session_state["usd_report"] = ur.generate_report(uctx)
+                    st.session_state["usd_report_meta"] = (
+                        f"{v.horizon_label} · данные на {raw.index.max().date()}")
+            except Exception as exc:
+                st.error(f"Не удалось сформировать отчёт по доллару: {exc}")
+
+    if st.session_state.get("usd_report"):
+        st.markdown("#### 💱 Отчёт по прогнозу курса доллара")
+        st.markdown(st.session_state["usd_report"])
+        st.caption(f"Сформировано ИИ · {st.session_state.get('usd_report_meta', '')}. "
+                   "Курс ЦБ РФ управляемый/сглаженный. Не является инвестиционной рекомендацией.")
 
     # --- Прогнозный график (Фаза F) ---
     if gen_chart:
