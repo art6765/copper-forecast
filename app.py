@@ -52,6 +52,7 @@ import brief
 import lme_forecast as lf
 import usd_forecast as uf
 import carry
+import china
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -394,6 +395,25 @@ user_premium = st.sidebar.number_input(
     "Ваша премия + логистика, $/т", min_value=0, max_value=2000, value=0, step=10,
     help="Физическая премия за катод (бренд/регион) + логистика + финансирование "
          "сверх биржевой цены. 0 — если не знаете: тогда показывается чистая биржа.")
+
+# --- Китайские индикаторы: ручной ввод (бесплатно; автосбор заблокирован) ---
+st.sidebar.markdown("### 🇨🇳 Китай (ручной ввод)")
+_china_saved = china.load_inputs()
+yangshan = st.sidebar.number_input(
+    "Премия Яншань, $/т", min_value=0, max_value=500,
+    value=int(_china_saved.get("yangshan", 0)), step=5,
+    help="Надбавка за импорт меди в Китай — сигнал спроса крупнейшего потребителя "
+         "(~60% рынка). Сверьтесь по ссылкам ниже и впишите. 0 — если не отслеживаете.")
+yangshan_trend = st.sidebar.selectbox(
+    "Тренд премии Яншань", china.TRENDS,
+    index=china.TRENDS.index(_china_saved.get("trend", "—"))
+          if _china_saved.get("trend", "—") in china.TRENDS else 0)
+if (yangshan != _china_saved.get("yangshan", 0)
+        or yangshan_trend != _china_saved.get("trend", "—")):
+    china.save_inputs({"yangshan": yangshan, "trend": yangshan_trend})
+st.sidebar.caption("Сверьтесь (бесплатно): "
+                   + " · ".join(f"[{n.split(' (')[0]}]({u})"
+                                for n, u in china.SOURCES.items()))
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Источники: Yahoo Finance (HG=F, DXY, WTI, Gold, Silver, S&P500, US10Y), "
@@ -809,6 +829,20 @@ def render_buyer():
 </div>
 """, unsafe_allow_html=True)
 
+    # --- Китайский сигнал: премия Яншань (ручной ввод, Сценарий 0) ---
+    ys = china.yangshan_signal(yangshan, yangshan_trend)
+    if ys:
+        _yc = {"ok": "#198754", "warn": "#F59E0B", "wait": "#E00613"}[ys["tone"]]
+        _yt = (f" <span style='color:#7F8B93'>· тренд: {ys['trend']}</span>"
+               if ys["trend"] != "—" else "")
+        st.markdown(f"""
+<div style='font-size:13px;margin:2px 0 8px;padding:9px 14px;background:#FAFAFC;
+            border-left:4px solid {_yc};border-radius:6px'>
+  <b>🇨🇳 Китай · премия Яншань: {ys['premium']:.0f} USD/т ({ys['level']})</b>{_yt}
+  <br><span style='color:#46535B'>{ys['note']}</span>
+</div>
+""", unsafe_allow_html=True)
+
     # --- Калибровка модели на этом сроке (Фаза K) ---
     acc = cached_accuracy(str(raw.index.max().date()))
     _hd = {h["key"]: h["days"] for h in HORIZONS}.get(chosen)
@@ -839,9 +873,10 @@ def render_buyer():
     # --- Слепые зоны данных (Фаза J: честность про непокрытое) ---
     with st.expander("🌫️ Слепые зоны: что система НЕ видит"):
         st.markdown(
-            "- **Китай (~60% мирового спроса)** — в системе только курс юаня. "
-            "Нет премии Яншань, запасов SHFE, импорта меди Китаем. Крупнейший "
-            "драйвер цены покрыт неполно.\n"
+            "- **Китай (~60% мирового спроса)** — премию Яншань можно вводить "
+            "вручную (панель слева, ссылки на бесплатные источники). "
+            "Авто-сбор запасов SHFE и импорта заблокирован (биржа блокирует ботов); "
+            "для авто-фида с историей нужна подписка SMM (~$800/год).\n"
             "- **Физические премии** (катодная премия за бренд/регион, CIF Shanghai, "
             "Роттердам) — нет бесплатного источника. Биржа ≠ цена контракта. "
             "Введите свою премию слева — увидите полную цену закупки.\n"
